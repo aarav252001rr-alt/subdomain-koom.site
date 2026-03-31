@@ -1,56 +1,52 @@
 require('dotenv').config();
-const http = require('http');
+const http    = require('http');
 const TelegramBot = require('node-telegram-bot-api');
-
-// ── HTTP Server — Render Web Service ke liye REQUIRED ─────────────────────────
-// Render Web Service ko ek open port chahiye hota hai, warna crash karta hai.
-const PORT = process.env.PORT || 3000;
-http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({
-    status: 'ok',
-    bot: 'SubDomain Bot v3',
-    domain: process.env.DOMAIN || 'yourdomain.com',
-    uptime: Math.floor(process.uptime()) + 's',
-    time: new Date().toISOString(),
-  }));
-}).listen(PORT, () => console.log(`✅ HTTP server running on port ${PORT}`));
 const { v4: uuidv4 } = require('uuid');
-const cron = require('node-cron');
-const cf = require('./cloudflare');
-const db = require('./database');
-const { validateSubdomain, validateDnsValue, stripUrl, statusEmoji, formatSubdomainCard, DNS_PRESETS } = require('./helpers');
+const cron    = require('node-cron');
+const cf      = require('./cloudflare');
+const db      = require('./database');
+const { validateSubdomain, validateDnsValue, stripUrl, statusEmoji, formatSubdomainCard } = require('./helpers');
 const { t, detectLang, LANGS } = require('./i18n');
-const { storeTgFile, getFileDownloadUrl, MAX_MB } = require('./storage');
+const { storeTgFile, getFileDownloadUrl } = require('./storage');
 
-// ── Config ────────────────────────────────────────────────────────────────────
+// ── Config ─────────────────────────────────────────────────────────────────────
 const TOKEN    = process.env.BOT_TOKEN;
-const ADMIN_ID = String(process.env.ADMIN_ID);
+const ADMIN_ID = String(process.env.ADMIN_ID || '');
 const DOMAIN   = process.env.DOMAIN || 'yourdomain.com';
-
 if (!TOKEN)    { console.error('❌ BOT_TOKEN missing'); process.exit(1); }
 if (!ADMIN_ID) { console.error('❌ ADMIN_ID missing');  process.exit(1); }
 
-// ── FIX: Use polling=true, this is a background worker on Render ──────────────
-const bot = new TelegramBot(TOKEN, { polling: true });
-console.log(`✅ SubDomain Bot v3 started | Domain: ${DOMAIN}`);
+// ── HTTP server — Render Web Service ke liye REQUIRED ─────────────────────────
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ status: 'ok', uptime: Math.floor(process.uptime()) + 's' }));
+}).listen(PORT, () => console.log(`✅ HTTP on port ${PORT}`));
 
-// ── Session store ─────────────────────────────────────────────────────────────
+// ── Bot init ───────────────────────────────────────────────────────────────────
+const bot = new TelegramBot(TOKEN, { polling: true });
+console.log(`✅ SubDomain Bot started | ${DOMAIN}`);
+
+// ── Sessions (in-memory, only for conversation flow — not data) ────────────────
 const sessions = {};
-const getSession  = (id) => sessions[String(id)] || {};
-const setSession  = (id, d) => { sessions[String(id)] = d; };
+const getSession   = (id) => sessions[String(id)] || {};
+const setSession   = (id, d) => { sessions[String(id)] = d; };
 const clearSession = (id) => { delete sessions[String(id)]; };
 
-// ── Utils ─────────────────────────────────────────────────────────────────────
-const isAdmin  = (id) => String(id) === ADMIN_ID;
-const isBanned = (id) => db.getUser(id)?.banned === true;
+// ── Core helpers ───────────────────────────────────────────────────────────────
+const isAdmin = (id) => String(id) === ADMIN_ID;
 
-function ensureUser(msg) {
-  db.upsertUser(msg.from.id, {
-    username:  msg.from.username  || '',
-    firstName: msg.from.first_name || '',
-    lastName:  msg.from.last_name  || '',
-    tgLang:    msg.from.language_code || 'en',
+async function isBanned(id) {
+  const u = await db.getUser(id);
+  return u?.banned === true;
+}
+
+async function ensureUser(from) {
+  await db.upsertUser(from.id, {
+    username:  from.username  || '',
+    firstName: from.first_name || '',
+    lastName:  from.last_name  || '',
+    tgLang:    from.language_code || 'en',
   });
 }
 
@@ -66,26 +62,26 @@ async function sendAdmin(text, extra = {}) {
   return reply(ADMIN_ID, text, extra);
 }
 
-function lang(userId) {
-  const l = db.getUserLang(userId);
+async function getLang(userId) {
+  const l = await db.getUserLang(userId);
   if (l === 'auto') {
-    const u = db.getUser(userId);
-    return detectLang(u?.tgLang);
+    const u = await db.getUser(userId);
+    return detectLang(u?.tgLang) || 'en';
   }
-  return l;
+  return l || 'en';
 }
 
-// ── Main Keyboard ─────────────────────────────────────────────────────────────
-function mainMenu(userId) {
-  const hi = lang(userId) === 'hi';
+// ── Main Menu keyboard ─────────────────────────────────────────────────────────
+async function mainMenu(userId) {
+  const hi = (await getLang(userId)) === 'hi';
   const buttons = [
     [{ text: hi ? '🌐 Subdomain Maango' : '🌐 Request Subdomain', callback_data: 'req_start' },
-     { text: hi ? '📋 Mere Subdomains' : '📋 My Subdomains',     callback_data: 'my_subs'   }],
-    [{ text: hi ? '📖 DNS Guide'        : '📖 DNS Guide',         callback_data: 'dns_guide' },
-     { text: hi ? '🔍 DNS Check'        : '🔍 Check DNS',         callback_data: 'check_dns' }],
-    [{ text: hi ? '🌐 Language'         : '🌐 Language',          callback_data: 'lang_menu' },
-     { text: hi ? '👤 Profile'          : '👤 Profile',           callback_data: 'profile'   }],
-    [{ text: hi ? '❓ Help'             : '❓ Help',              callback_data: 'help'      }],
+     { text: hi ? '📋 Mere Subdomains'  : '📋 My Subdomains',     callback_data: 'my_subs'  }],
+    [{ text: '📖 DNS Guide', callback_data: 'dns_guide' },
+     { text: '🔍 Check DNS', callback_data: 'check_dns' }],
+    [{ text: '🌐 Language',  callback_data: 'lang_menu' },
+     { text: '👤 Profile',   callback_data: 'profile'   }],
+    [{ text: '❓ Help',      callback_data: 'help'      }],
   ];
   if (isAdmin(userId)) {
     buttons.push([
@@ -101,366 +97,467 @@ function mainMenu(userId) {
 // ══════════════════════════════════════════════════════════════════════════════
 
 bot.onText(/\/start/, async (msg) => {
-  ensureUser(msg);
-  if (isBanned(msg.from.id) && !isAdmin(msg.from.id)) return reply(msg.chat.id, t(msg.from.id, 'banned'));
-  if (db.getSetting('maintenanceMode') && !isAdmin(msg.from.id)) return reply(msg.chat.id, t(msg.from.id, 'maintenance'));
-  await reply(msg.chat.id, t(msg.from.id, 'welcome', msg.from.first_name, DOMAIN, db.getSetting('welcomeMsg')), mainMenu(msg.from.id));
+  try {
+    await ensureUser(msg.from);
+    if (await isBanned(msg.from.id) && !isAdmin(msg.from.id))
+      return reply(msg.chat.id, '🚫 Aapko ban kar diya gaya hai.');
+    const maintenance = await db.getSetting('maintenanceMode');
+    if (maintenance && !isAdmin(msg.from.id))
+      return reply(msg.chat.id, '🔧 Bot maintenance mode mein hai. Baad mein try karein.');
+    const welcomeMsg = await db.getSetting('welcomeMsg');
+    const menu = await mainMenu(msg.from.id);
+    await reply(msg.chat.id,
+      `⬡ *SubDomain Bot — ${DOMAIN}*\n\nNamaste *${msg.from.first_name}*! 👋\n\n${welcomeMsg}\n\n_Apna free subdomain abhi lo!_`,
+      menu
+    );
+  } catch (e) { console.error('/start error:', e.message); }
 });
 
-bot.onText(/\/help/,         (msg) => { ensureUser(msg); showHelp(msg.chat.id, msg.from.id); });
-bot.onText(/\/request/,      (msg) => { ensureUser(msg); if (!isBanned(msg.from.id)) startRequest(msg.chat.id, msg.from.id); });
-bot.onText(/\/mysubdomains/, (msg) => { ensureUser(msg); showMySubdomains(msg.chat.id, msg.from.id); });
-bot.onText(/\/language/,     (msg) => { ensureUser(msg); showLangMenu(msg.chat.id, msg.from.id); });
-bot.onText(/\/cancel/,       (msg) => { clearSession(msg.from.id); reply(msg.chat.id, lang(msg.from.id) === 'hi' ? '✅ Action cancel ho gayi.' : '✅ Action cancelled.', mainMenu(msg.from.id)); });
-bot.onText(/\/stats/,        (msg) => { if (isAdmin(msg.from.id)) showAdminStats(msg.chat.id); });
+bot.onText(/\/help/, async (msg) => {
+  try {
+    await ensureUser(msg.from);
+    await showHelp(msg.chat.id, msg.from.id);
+  } catch (e) { console.error(e.message); }
+});
+
+bot.onText(/\/request/, async (msg) => {
+  try {
+    await ensureUser(msg.from);
+    if (await isBanned(msg.from.id)) return;
+    await startRequest(msg.chat.id, msg.from.id);
+  } catch (e) { console.error(e.message); }
+});
+
+bot.onText(/\/mysubdomains/, async (msg) => {
+  try {
+    await ensureUser(msg.from);
+    await showMySubdomains(msg.chat.id, msg.from.id);
+  } catch (e) { console.error(e.message); }
+});
+
+bot.onText(/\/language/, async (msg) => {
+  try {
+    await ensureUser(msg.from);
+    await showLangMenu(msg.chat.id);
+  } catch (e) { console.error(e.message); }
+});
+
+bot.onText(/\/cancel/, async (msg) => {
+  clearSession(msg.from.id);
+  const menu = await mainMenu(msg.from.id);
+  await reply(msg.chat.id, '✅ Cancel ho gaya.', menu);
+});
+
+bot.onText(/\/stats/, async (msg) => {
+  if (!isAdmin(msg.from.id)) return;
+  try { await showAdminStats(msg.chat.id); } catch (e) { console.error(e.message); }
+});
+
 bot.onText(/\/broadcast (.+)/, async (msg, match) => {
   if (!isAdmin(msg.from.id)) return;
-  doBroadcast(msg.chat.id, match[1]);
+  try { await doBroadcast(msg.chat.id, match[1]); } catch (e) { console.error(e.message); }
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// CALLBACK QUERIES
+// CALLBACK QUERIES — all properly awaited
 // ══════════════════════════════════════════════════════════════════════════════
 
 bot.on('callback_query', async (query) => {
   const { data, message, from } = query;
   const chatId = message.chat.id;
   const userId = from.id;
-  await bot.answerCallbackQuery(query.id).catch(() => {});
-  ensureUser({ from, chat: message.chat });
-  if (isBanned(userId) && !isAdmin(userId)) return reply(chatId, t(userId, 'banned'));
 
-  // Navigation
-  if (data === 'main_menu')  return reply(chatId, '🏠', mainMenu(userId));
-  if (data === 'help')       return showHelp(chatId, userId);
-  if (data === 'profile')    return showProfile(chatId, userId);
-  if (data === 'my_subs')    return showMySubdomains(chatId, userId);
-  if (data === 'dns_guide')  return showDnsGuide(chatId, userId);
-  if (data === 'check_dns')  return startDnsCheck(chatId, userId);
-  if (data === 'lang_menu')  return showLangMenu(chatId, userId);
-  if (data.startsWith('set_lang_')) return setLang(chatId, userId, data.replace('set_lang_', ''));
+  try {
+    await bot.answerCallbackQuery(query.id).catch(() => {});
+    await ensureUser(from);
 
-  // Request flow
-  if (data === 'req_start')  return startRequest(chatId, userId);
-  if (data === 'req_confirm') return confirmRequest(chatId, userId);
-  if (data === 'req_cancel')  { clearSession(userId); return reply(chatId, '❌', mainMenu(userId)); }
-  if (data.startsWith('dns_preset_'))        return handleDnsPreset(chatId, userId, data.replace('dns_preset_', ''));
+    if (await isBanned(userId) && !isAdmin(userId))
+      return reply(chatId, '🚫 Aapko ban kar diya gaya hai.');
 
-  // My subdomains
-  if (data.startsWith('sub_detail_'))        return showSubDetail(chatId, userId, data.replace('sub_detail_', ''));
-  if (data.startsWith('sub_dns_'))           return startDnsUpdate(chatId, userId, data.replace('sub_dns_', ''));
-  if (data.startsWith('sub_upload_'))        return startFileUpload(chatId, userId, data.replace('sub_upload_', ''));
-  if (data.startsWith('sub_delete_confirm_')) return doDeleteSub(chatId, userId, data.replace('sub_delete_confirm_', ''));
-  if (data.startsWith('sub_delete_'))        return confirmDeleteSub(chatId, userId, data.replace('sub_delete_', ''));
-  if (data.startsWith('dns_upd_preset_'))    return applyDnsUpdatePreset(chatId, userId, data.replace('dns_upd_preset_', ''));
+    // ── Navigation ─────────────────────────────────────────────────────────
+    if (data === 'main_menu') {
+      const menu = await mainMenu(userId);
+      return reply(chatId, '🏠 Main Menu:', menu);
+    }
+    if (data === 'help')       return showHelp(chatId, userId);
+    if (data === 'profile')    return showProfile(chatId, userId);
+    if (data === 'my_subs')    return showMySubdomains(chatId, userId);
+    if (data === 'dns_guide')  return showDnsGuide(chatId, userId);
+    if (data === 'check_dns')  return startDnsCheck(chatId, userId);
+    if (data === 'lang_menu')  return showLangMenu(chatId);
 
-  // Admin
-  if (data === 'admin_panel')       return showAdminPanel(chatId);
-  if (data === 'admin_pending')     return showPendingRequests(chatId);
-  if (data === 'admin_active')      return showAdminSubdomains(chatId, 'active');
-  if (data === 'admin_all')         return showAdminSubdomains(chatId, 'all');
-  if (data === 'admin_users')       return showAdminUsers(chatId);
-  if (data === 'admin_settings')    return showAdminSettings(chatId);
-  if (data === 'admin_stats')       return showAdminStats(chatId);
-  if (data === 'toggle_approval')   return toggleApproval(chatId);
-  if (data === 'toggle_maintenance') return toggleMaintenance(chatId);
-  if (data === 'toggle_broadcast_prefix') return toggleBroadcastPrefix(chatId, userId);
-  if (data === 'set_welcome')       return startSetWelcome(chatId, userId);
-  if (data === 'set_maxsubs')       return startSetMaxSubs(chatId, userId);
-  if (data === 'broadcast_start')   return startBroadcast(chatId, userId);
-  if (data.startsWith('approve_'))  return adminApprove(chatId, data.replace('approve_', ''));
-  if (data.startsWith('reject_'))   return adminReject(chatId, userId, data.replace('reject_', ''));
-  if (data.startsWith('suspend_'))  return adminSuspend(chatId, data.replace('suspend_', ''));
-  if (data.startsWith('unsuspend_')) return adminUnsuspend(chatId, data.replace('unsuspend_', ''));
-  if (data.startsWith('admin_del_')) return adminDeleteSub(chatId, data.replace('admin_del_', ''));
-  if (data.startsWith('ban_'))      return adminBanUser(chatId, data.replace('ban_', ''));
-  if (data.startsWith('unban_'))    return adminUnbanUser(chatId, data.replace('unban_', ''));
+    if (data.startsWith('set_lang_')) {
+      const l = data.replace('set_lang_', '');
+      await db.upsertUser(userId, { lang: l });
+      const menu = await mainMenu(userId);
+      return reply(chatId, `✅ Language set: *${l === 'auto' ? 'Auto' : LANGS[l] || l}*`, menu);
+    }
+
+    // ── Request flow ───────────────────────────────────────────────────────
+    if (data === 'req_start')   return startRequest(chatId, userId);
+    if (data === 'req_confirm') return confirmRequest(chatId, userId);
+    if (data === 'req_cancel')  {
+      clearSession(userId);
+      const menu = await mainMenu(userId);
+      return reply(chatId, '❌ Request cancel ho gayi.', menu);
+    }
+    if (data.startsWith('dns_preset_'))
+      return handleDnsPreset(chatId, userId, data.replace('dns_preset_', ''));
+
+    // ── My Subdomains ──────────────────────────────────────────────────────
+    if (data.startsWith('sub_detail_'))
+      return showSubDetail(chatId, userId, data.replace('sub_detail_', ''));
+    if (data.startsWith('sub_dns_'))
+      return startDnsUpdate(chatId, userId, data.replace('sub_dns_', ''));
+    if (data.startsWith('sub_upload_'))
+      return startFileUpload(chatId, userId, data.replace('sub_upload_', ''));
+    if (data.startsWith('sub_delete_confirm_'))
+      return doDeleteSub(chatId, userId, data.replace('sub_delete_confirm_', ''));
+    if (data.startsWith('sub_delete_'))
+      return confirmDeleteSub(chatId, userId, data.replace('sub_delete_', ''));
+    if (data.startsWith('dns_upd_preset_'))
+      return applyDnsUpdatePreset(chatId, userId, data.replace('dns_upd_preset_', ''));
+
+    // ── Admin ──────────────────────────────────────────────────────────────
+    if (!isAdmin(userId)) return; // all below = admin only
+
+    if (data === 'admin_panel')          return showAdminPanel(chatId);
+    if (data === 'admin_pending')        return showPendingRequests(chatId);
+    if (data === 'admin_active')         return showAdminSubdomains(chatId, 'active');
+    if (data === 'admin_all')            return showAdminSubdomains(chatId, 'all');
+    if (data === 'admin_users')          return showAdminUsers(chatId);
+    if (data === 'admin_settings')       return showAdminSettings(chatId);
+    if (data === 'admin_stats')          return showAdminStats(chatId);
+    if (data === 'toggle_approval')      return toggleApproval(chatId);
+    if (data === 'toggle_maintenance')   return toggleMaintenance(chatId);
+    if (data === 'toggle_bcast_prefix')  return toggleBroadcastPrefix(chatId, userId);
+    if (data === 'set_welcome')          return startSetWelcome(chatId, userId);
+    if (data === 'set_maxsubs')          return startSetMaxSubs(chatId, userId);
+    if (data === 'broadcast_start')      return startBroadcast(chatId, userId);
+
+    if (data.startsWith('approve_'))  return adminApprove(chatId, data.replace('approve_', ''));
+    if (data.startsWith('reject_'))   return adminReject(chatId, userId, data.replace('reject_', ''));
+    if (data.startsWith('suspend_'))  return adminSuspend(chatId, data.replace('suspend_', ''));
+    if (data.startsWith('unsuspend_')) return adminUnsuspend(chatId, data.replace('unsuspend_', ''));
+    if (data.startsWith('admin_del_')) return adminDeleteSub(chatId, data.replace('admin_del_', ''));
+    if (data.startsWith('ban_'))      return adminBanUser(chatId, data.replace('ban_', ''));
+    if (data.startsWith('unban_'))    return adminUnbanUser(chatId, data.replace('unban_', ''));
+
+  } catch (e) {
+    console.error('Callback error:', e.message, '| data:', data);
+    reply(chatId, `❌ Error: ${e.message}`).catch(() => {});
+  }
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// MESSAGE HANDLER — state machine + file uploads
+// MESSAGE HANDLER
 // ══════════════════════════════════════════════════════════════════════════════
 
 bot.on('message', async (msg) => {
+  if (!msg.from) return;
   const userId = msg.from.id;
   const chatId = msg.chat.id;
   const session = getSession(userId);
 
-  // ── File Upload ────────────────────────────────────────────────────────────
-  if (msg.document && session.step === 'file_upload') {
-    const { subId } = session.data;
-    const sub = db.getSubdomainById(subId);
-    if (!sub || sub.userId !== String(userId)) return;
-    clearSession(userId);
+  try {
+    // ── File upload ──────────────────────────────────────────────────────────
+    if (msg.document && session.step === 'file_upload') {
+      clearSession(userId);
+      const { subId } = session.data;
+      const sub = await db.getSubdomainById(subId);
+      if (!sub || sub.userId !== String(userId)) return;
 
-    await reply(chatId, lang(userId) === 'hi' ? '⏳ File upload ho rahi hai...' : '⏳ Uploading file...');
+      await reply(chatId, '⏳ File upload ho rahi hai...');
+      const result = await storeTgFile(bot, msg, subId, sub.subdomain, DOMAIN);
 
-    const result = await storeTgFile(bot, msg, subId, sub.subdomain, DOMAIN);
-    if (result.error === 'wrong_type') return reply(chatId, t(userId, 'file_wrong_type'));
-    if (result.error === 'too_big')    return reply(chatId, t(userId, 'file_toobig', result.mb));
-    if (result.error)                  return reply(chatId, `❌ Error: ${result.error}`);
+      if (result.error === 'wrong_type') return reply(chatId, '❌ Sirf .html ya .zip files allowed hain.');
+      if (result.error === 'too_big')    return reply(chatId, `❌ File bahut badi hai! Max 5MB.\nAapki file: ${result.mb}MB`);
+      if (result.error)                  return reply(chatId, `❌ Upload error: ${result.error}`);
 
-    const { record } = result;
-    const dlUrl = getFileDownloadUrl(record);
-
-    await reply(chatId,
-      t(userId, 'file_uploaded', record.fileName, sub.fullDomain) +
-      `\n\n📥 [Download File](${dlUrl})\n\n` +
-      (lang(userId) === 'hi'
-        ? `_Note: File Telegram pe store hai. Isko Netlify/Vercel pe manually upload karo website ke liye._`
-        : `_Note: File stored on Telegram. Upload it to Netlify/Vercel/GitHub Pages to deploy your website._`),
-      { ...mainMenu(userId), disable_web_page_preview: true }
-    );
-
-    // Notify admin of upload
-    sendAdmin(`📁 *File Uploaded*\n\n👤 ${sub.userName} | \`${sub.fullDomain}\`\n📄 ${record.fileName} (${(record.fileSize/1024/1024).toFixed(2)}MB)`);
-    return;
-  }
-
-  if (!msg.text || msg.text.startsWith('/')) return;
-  const text = msg.text.trim();
-  if (!session.step) return;
-
-  // ── Request flow ───────────────────────────────────────────────────────────
-  if (session.step === 'req_name') {
-    const name = text.toLowerCase().trim();
-    const err = validateSubdomain(name);
-    if (err) return reply(chatId, `❌ ${lang(userId) === 'hi' ? 'Galat naam' : 'Invalid name'}: ${err.replace('INVALID: ','')}`);
-    if (db.getSubdomain(name)) return reply(chatId, `❌ \`${name}.${DOMAIN}\` ${lang(userId) === 'hi' ? 'already le li gayi.' : 'already taken.'}`);
-    setSession(userId, { ...session, step: 'req_purpose', data: { ...session.data, subdomain: name } });
-    return reply(chatId, t(userId, 'ask_purpose', name, DOMAIN));
-  }
-
-  if (session.step === 'req_purpose') {
-    if (text.length < 5) return reply(chatId, lang(userId) === 'hi' ? '❌ Thoda detail mein batao (5+ characters).' : '❌ Please describe more (5+ chars).');
-    setSession(userId, { ...session, step: 'req_dns_type', data: { ...session.data, purpose: text } });
-    return reply(chatId, t(userId, 'ask_hosting'), {
-      parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: [
-        [{ text: '▲ Vercel',        callback_data: 'dns_preset_vercel'  }, { text: '◈ Netlify',      callback_data: 'dns_preset_netlify' }],
-        [{ text: '● GitHub Pages',  callback_data: 'dns_preset_github'  }, { text: '◉ Custom VPS',   callback_data: 'dns_preset_vps'     }],
-        [{ text: '⬡ NS Delegation', callback_data: 'dns_preset_ns'      }],
-        [{ text: '✏️ Manual',        callback_data: 'dns_preset_manual'  }],
-      ]},
-    });
-  }
-
-  if (session.step === 'req_dns_type_manual') {
-    const type = text.toUpperCase();
-    if (!['CNAME','A','NS','TXT'].includes(type)) return reply(chatId, '❌ Type must be: CNAME, A, NS, or TXT');
-    setSession(userId, { ...session, step: 'req_dns_value', data: { ...session.data, dnsType: type } });
-    return reply(chatId, `📌 Enter ${type} value:\n\n${type === 'A' ? 'Example: `1.2.3.4`' : 'Example: `target.example.com`'}`);
-  }
-
-  if (session.step === 'req_dns_value') {
-    let val = text;
-    // Auto-fix: strip https:// if user pastes full URL
-    if (val.startsWith('http')) val = stripUrl(val);
-
-    const err = validateDnsValue(session.data.dnsType, val);
-    if (err === 'INVALID_A')         return reply(chatId, `❌ Enter a valid IP address.\nExample: \`1.2.3.4\``);
-    if (err === 'INVALID_CNAME')     return reply(chatId, `❌ Enter a valid domain.\nExample: \`yoursite.netlify.app\``);
-    if (err === 'INVALID_CNAME_URL') val = stripUrl(val); // strip and retry
-    if (err === 'INVALID_NS')        return reply(chatId, `❌ Enter a valid nameserver domain.`);
-
-    setSession(userId, { ...session, step: 'req_confirm_wait', data: { ...session.data, dnsValue: val } });
-    return showRequestConfirm(chatId, userId);
-  }
-
-  // ── DNS update value ───────────────────────────────────────────────────────
-  if (session.step === 'dns_update_value') {
-    const { subId, dnsType } = session.data;
-    let val = text;
-    if (val.startsWith('http')) val = stripUrl(val);
-
-    const err = validateDnsValue(dnsType, val);
-    if (err && err !== 'INVALID_CNAME_URL') return reply(chatId, `❌ Invalid value. Try again.`);
-
-    clearSession(userId);
-    const sub = db.getSubdomainById(subId);
-    if (!sub || sub.userId !== String(userId)) return reply(chatId, '❌ Not found.');
-
-    try {
-      const record = await cf.updateRecord(sub.cfRecordId, sub.subdomain, dnsType, val);
-      db.updateSubdomain(subId, { dnsType, dnsValue: val, cfRecordId: record.id });
-      reply(chatId, t(userId, 'dns_updated', sub.fullDomain, dnsType, val), mainMenu(userId));
-    } catch (e) {
-      reply(chatId, `❌ DNS update failed: ${e.message}`, mainMenu(userId));
+      const dlUrl = getFileDownloadUrl(result.record);
+      const menu = await mainMenu(userId);
+      await reply(chatId,
+        `✅ *File Upload Ho Gayi!*\n\n📁 \`${result.record.fileName}\`\n🌐 \`https://${sub.fullDomain}\`\n\n📥 [Download File](${dlUrl})\n\n_Note: File Telegram pe stored hai. Isko Netlify/Vercel pe upload karo website ke liye._`,
+        { ...menu, disable_web_page_preview: true }
+      );
+      return;
     }
-    return;
-  }
 
-  // ── DNS Check ──────────────────────────────────────────────────────────────
-  if (session.step === 'dns_check') {
-    clearSession(userId);
-    const name = text.toLowerCase().trim();
-    try {
-      const records = await cf.listRecords(name);
-      if (!records.length) return reply(chatId, `🔍 \`${name}.${DOMAIN}\`\n\n❌ No DNS records on Cloudflare.\n_Wait 5–30 min for propagation._`);
-      const list = records.map(r => `• \`${r.type}\` → \`${r.content}\``).join('\n');
-      reply(chatId, `🔍 *DNS Records — ${name}.${DOMAIN}*\n\n${list}\n\n✅ Active on Cloudflare!`);
-    } catch (e) {
-      reply(chatId, `❌ DNS check failed: ${e.message}`);
+    if (!msg.text || msg.text.startsWith('/')) return;
+    const text = msg.text.trim();
+    if (!session.step) return;
+
+    // ── Request: subdomain name ──────────────────────────────────────────────
+    if (session.step === 'req_name') {
+      const name = text.toLowerCase().trim();
+      const err = validateSubdomain(name);
+      if (err) return reply(chatId, `❌ ${err}\n\nDobara try karein ya /cancel`);
+
+      const exists = await db.getSubdomain(name);
+      if (exists) return reply(chatId, `❌ \`${name}.${DOMAIN}\` already le li gayi hai. Dusra naam try karo.`);
+
+      setSession(userId, { ...session, step: 'req_purpose', data: { ...session.data, subdomain: name } });
+      return reply(chatId, `✅ \`${name}.${DOMAIN}\` available hai!\n\n📝 Is subdomain ka kya use karoge?\n_(Example: Portfolio, blog, project, etc.)_`);
     }
-    return;
-  }
 
-  // ── Admin flows ────────────────────────────────────────────────────────────
-  if (session.step === 'admin_reject_reason' && isAdmin(userId)) {
-    const { subId } = session.data;
-    clearSession(userId);
-    const sub = db.getSubdomainById(subId);
-    if (!sub) return reply(chatId, '❌ Not found.');
-    db.updateSubdomain(subId, { status: 'rejected', rejectReason: text });
-    reply(chatId, `❌ \`${sub.fullDomain}\` rejected.\nReason: _${text}_`);
-    try { bot.sendMessage(sub.userId, t(sub.userId, 'req_rejected', sub, text), { parse_mode: 'Markdown' }); } catch {}
-    return;
-  }
+    // ── Request: purpose ─────────────────────────────────────────────────────
+    if (session.step === 'req_purpose') {
+      if (text.length < 5) return reply(chatId, '❌ Thoda detail mein batao (5+ characters).');
+      setSession(userId, { ...session, step: 'req_hosting', data: { ...session.data, purpose: text } });
+      return reply(chatId, '📖 *Hosting Provider Chuniye:*', {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [
+          [{ text: '▲ Vercel',        callback_data: 'dns_preset_vercel'  },
+           { text: '◈ Netlify',       callback_data: 'dns_preset_netlify' }],
+          [{ text: '● GitHub Pages',  callback_data: 'dns_preset_github'  },
+           { text: '◉ Custom VPS/IP', callback_data: 'dns_preset_vps'     }],
+          [{ text: '⬡ NS Delegation', callback_data: 'dns_preset_ns'      }],
+          [{ text: '✏️ Manual Entry',  callback_data: 'dns_preset_manual'  }],
+          [{ text: '❌ Cancel',        callback_data: 'req_cancel'         }],
+        ]},
+      });
+    }
 
-  if (session.step === 'broadcast_msg' && isAdmin(userId)) {
-    clearSession(userId);
-    doBroadcast(chatId, text);
-    return;
-  }
+    // ── Request: manual DNS type ─────────────────────────────────────────────
+    if (session.step === 'req_dns_type') {
+      const type = text.toUpperCase();
+      if (!['CNAME','A','NS','TXT'].includes(type))
+        return reply(chatId, '❌ Type must be: `CNAME`, `A`, `NS`, or `TXT`');
+      setSession(userId, { ...session, step: 'req_dns_value', data: { ...session.data, dnsType: type } });
+      const ex = type === 'A' ? '`1.2.3.4`' : type === 'NS' ? '`ns1.provider.com`' : '`target.example.com`';
+      return reply(chatId, `📌 ${type} value daalo:\nExample: ${ex}`);
+    }
 
-  if (session.step === 'set_welcome' && isAdmin(userId)) {
-    clearSession(userId);
-    db.setSetting('welcomeMsg', text);
-    reply(chatId, `✅ Welcome message updated!\n\n_"${text}"_`);
-    return;
-  }
+    // ── Request: DNS value ───────────────────────────────────────────────────
+    if (session.step === 'req_dns_value') {
+      let val = text;
+      if (val.startsWith('http')) val = stripUrl(val);
+      const err = validateDnsValue(session.data.dnsType, val);
+      if (err) {
+        const hints = {
+          'INVALID_A':    '❌ Valid IP address daalo.\nExample: `1.2.3.4`',
+          'INVALID_CNAME':'❌ Valid domain daalo (https:// mat daalo).\nExample: `yoursite.netlify.app`',
+          'INVALID_NS':   '❌ Valid nameserver daalo.\nExample: `ns1.provider.com`',
+        };
+        return reply(chatId, hints[err] || `❌ Invalid value: ${err}`);
+      }
+      setSession(userId, { ...session, step: 'req_confirm_wait', data: { ...session.data, dnsValue: val } });
+      return showRequestConfirm(chatId, userId);
+    }
 
-  if (session.step === 'set_maxsubs' && isAdmin(userId)) {
-    clearSession(userId);
-    const n = parseInt(text);
-    if (isNaN(n) || n < 1 || n > 50) return reply(chatId, '❌ Enter number 1–50.');
-    db.setSetting('maxPerUser', n);
-    reply(chatId, `✅ Max subdomains per user set to *${n}*`);
-    return;
+    // ── DNS update value ─────────────────────────────────────────────────────
+    if (session.step === 'dns_update_value') {
+      const { subId, dnsType } = session.data;
+      let val = text;
+      if (val.startsWith('http')) val = stripUrl(val);
+      const err = validateDnsValue(dnsType, val);
+      if (err && err !== 'INVALID_CNAME_URL') return reply(chatId, '❌ Invalid value. Try again.');
+      clearSession(userId);
+
+      const sub = await db.getSubdomainById(subId);
+      if (!sub || sub.userId !== String(userId)) return reply(chatId, '❌ Not found.');
+
+      try {
+        const rec = await cf.updateRecord(sub.cfRecordId, sub.subdomain, dnsType, val);
+        await db.updateSubdomain(subId, { dnsType, dnsValue: val, cfRecordId: rec.id });
+        const menu = await mainMenu(userId);
+        return reply(chatId, `✅ *DNS Update Ho Gaya!*\n\n\`${sub.fullDomain}\`\n\`${dnsType}\` → \`${val}\`\n\n🌐 Cloudflare pe update ho gaya!\n_Propagation: 1–30 min_`, menu);
+      } catch (e) {
+        const menu = await mainMenu(userId);
+        return reply(chatId, `❌ DNS update failed: ${e.message}`, menu);
+      }
+    }
+
+    // ── DNS check ────────────────────────────────────────────────────────────
+    if (session.step === 'dns_check') {
+      clearSession(userId);
+      const name = text.toLowerCase().trim();
+      try {
+        const records = await cf.listRecords(name);
+        if (!records.length)
+          return reply(chatId, `🔍 \`${name}.${DOMAIN}\`\n\n❌ Koi DNS record nahi mila.\n_5–30 min wait karo propagation ke liye._`);
+        const list = records.map(r => `• \`${r.type}\` → \`${r.content}\``).join('\n');
+        return reply(chatId, `🔍 *DNS Records — ${name}.${DOMAIN}*\n\n${list}\n\n✅ Cloudflare pe active hai!`);
+      } catch (e) {
+        return reply(chatId, `❌ DNS check failed: ${e.message}`);
+      }
+    }
+
+    // ── Admin: reject reason ─────────────────────────────────────────────────
+    if (session.step === 'reject_reason' && isAdmin(userId)) {
+      const { subId } = session.data;
+      clearSession(userId);
+      const sub = await db.getSubdomainById(subId);
+      if (!sub) return reply(chatId, '❌ Not found.');
+      await db.updateSubdomain(subId, { status: 'rejected', rejectReason: text });
+      await reply(chatId, `❌ \`${sub.fullDomain}\` reject kar diya.\nReason: _${text}_`);
+      try {
+        await bot.sendMessage(sub.userId,
+          `❌ *Subdomain Request Reject Ho Gayi*\n\n\`${sub.fullDomain}\`\n\nReason: _${text}_\n\nDusra naam try karo — /request`,
+          { parse_mode: 'Markdown' }
+        );
+      } catch {}
+      return;
+    }
+
+    // ── Admin: broadcast ─────────────────────────────────────────────────────
+    if (session.step === 'broadcast_msg' && isAdmin(userId)) {
+      clearSession(userId);
+      await doBroadcast(chatId, text);
+      return;
+    }
+
+    // ── Admin: welcome msg ────────────────────────────────────────────────────
+    if (session.step === 'set_welcome' && isAdmin(userId)) {
+      clearSession(userId);
+      await db.setSetting('welcomeMsg', text);
+      return reply(chatId, `✅ Welcome message update ho gaya!\n\n_"${text}"_`);
+    }
+
+    // ── Admin: max subs ───────────────────────────────────────────────────────
+    if (session.step === 'set_maxsubs' && isAdmin(userId)) {
+      clearSession(userId);
+      const n = parseInt(text);
+      if (isNaN(n) || n < 1 || n > 50) return reply(chatId, '❌ 1–50 ke beech number daalo.');
+      await db.setSetting('maxPerUser', n);
+      return reply(chatId, `✅ Max subdomains per user: *${n}*`);
+    }
+
+  } catch (e) {
+    console.error('Message handler error:', e.message);
   }
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// FEATURE FUNCTIONS
+// FEATURE FUNCTIONS — all async/await
 // ══════════════════════════════════════════════════════════════════════════════
 
-function showHelp(chatId, userId) {
-  reply(chatId, t(userId, 'help', DOMAIN, isAdmin(userId)), mainMenu(userId));
+async function showHelp(chatId, userId) {
+  const menu = await mainMenu(userId);
+  await reply(chatId,
+    `❓ *SubDomain Bot Help*\n\n` +
+    `🌐 *${DOMAIN}* pe free subdomains lo\n\n` +
+    `*Commands:*\n` +
+    `/start — Main menu\n` +
+    `/request — Naya subdomain maango\n` +
+    `/mysubdomains — Apne subdomains dekho\n` +
+    `/language — Language change karo\n` +
+    `/cancel — Cancel karo\n` +
+    (isAdmin(userId) ? '\n👑 *Admin:*\n/stats — Statistics\n/broadcast msg — Sabko message' : ''),
+    menu
+  );
 }
 
-function showProfile(chatId, userId) {
-  const user = db.getUser(userId);
-  const subs = db.getUserSubdomains(userId);
-  const maxPerUser = db.getSetting('maxPerUser');
-  const hi = lang(userId) === 'hi';
-  reply(chatId,
-    `👤 *${hi ? 'Meri Profile' : 'My Profile'}*\n\n` +
+async function showProfile(chatId, userId) {
+  const user = await db.getUser(userId);
+  const subs = await db.getUserSubdomains(userId);
+  const maxPerUser = await db.getSetting('maxPerUser');
+  const menu = await mainMenu(userId);
+  await reply(chatId,
+    `👤 *Profile*\n\n` +
     `🆔 ID: \`${userId}\`\n` +
     `👤 ${user?.firstName || ''} ${user?.lastName || ''}\n` +
     `📛 @${user?.username || 'N/A'}\n` +
-    `🌐 ${hi ? 'Language' : 'Language'}: ${LANGS[lang(userId)] || 'Auto'}\n\n` +
+    `🌐 Language: ${LANGS[user?.lang] || 'Auto'}\n\n` +
     `🌐 *Subdomains:* ${subs.filter(s => s.status !== 'rejected').length}/${maxPerUser}\n` +
     `🟢 Active: ${subs.filter(s => s.status === 'active').length}\n` +
     `🟡 Pending: ${subs.filter(s => s.status === 'pending').length}\n\n` +
     `${user?.banned ? '🚫 *BANNED*' : '✅ Active'}`,
-    mainMenu(userId)
+    menu
   );
 }
 
-// ── Language ──────────────────────────────────────────────────────────────────
-function showLangMenu(chatId, userId) {
-  reply(chatId,
-    '🌐 *Select Language / भाषा चुनें*',
-    { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [
-      [{ text: '🇬🇧 English', callback_data: 'set_lang_en' }, { text: '🇮🇳 Hindi / हिंदी', callback_data: 'set_lang_hi' }],
-      [{ text: '🤖 Auto Detect', callback_data: 'set_lang_auto' }],
-    ]}}
-  );
+function showLangMenu(chatId) {
+  return reply(chatId, '🌐 *Select Language / भाषा चुनें*', {
+    parse_mode: 'Markdown',
+    reply_markup: { inline_keyboard: [
+      [{ text: '🇬🇧 English',       callback_data: 'set_lang_en'   }],
+      [{ text: '🇮🇳 Hindi / हिंदी', callback_data: 'set_lang_hi'   }],
+      [{ text: '🤖 Auto Detect',    callback_data: 'set_lang_auto' }],
+    ]},
+  });
 }
 
-function setLang(chatId, userId, l) {
-  db.upsertUser(userId, { lang: l });
-  reply(chatId, t(userId, 'lang_set', l === 'auto' ? 'Auto' : LANGS[l]), mainMenu(userId));
-}
-
-// ── Request Flow ──────────────────────────────────────────────────────────────
-function startRequest(chatId, userId) {
-  const max = db.getSetting('maxPerUser');
-  const userSubs = db.getUserSubdomains(userId).filter(s => ['active','pending'].includes(s.status));
-  if (userSubs.length >= max) return reply(chatId, t(userId, 'max_limit', max), mainMenu(userId));
-
+// ── Request flow ───────────────────────────────────────────────────────────────
+async function startRequest(chatId, userId) {
+  const max = await db.getSetting('maxPerUser');
+  const userSubs = await db.getUserSubdomains(userId);
+  const active = userSubs.filter(s => ['active','pending'].includes(s.status));
+  if (active.length >= max) {
+    const menu = await mainMenu(userId);
+    return reply(chatId, `❌ Aapke paas already *${active.length}/${max}* subdomains hain.\n\nEk delete karo phir naya lo — /mysubdomains`, menu);
+  }
   clearSession(userId);
   setSession(userId, { step: 'req_name', data: {} });
-  reply(chatId, t(userId, 'start_req', DOMAIN));
+  return reply(chatId,
+    `🌐 *Naya Subdomain Request*\n\n` +
+    `Step 1 — *Subdomain naam batao:*\n\n` +
+    `📌 Rules:\n• Sirf lowercase letters, numbers, hyphen (-)\n• 3 se 30 characters\n• Example: \`mysite\`, \`my-blog\`\n\n` +
+    `Aapko milega: \`naam.${DOMAIN}\`\n\n/cancel se rok sakte ho.`
+  );
 }
 
-function handleDnsPreset(chatId, userId, preset) {
+async function handleDnsPreset(chatId, userId, preset) {
   const session = getSession(userId);
+  if (!session.data) return startRequest(chatId, userId);
 
   if (preset === 'manual') {
-    setSession(userId, { ...session, step: 'req_dns_type_manual' });
-    return reply(chatId, '✏️ Enter DNS type:\n\n`CNAME` | `A` | `NS` | `TXT`');
+    setSession(userId, { ...session, step: 'req_dns_type' });
+    return reply(chatId, '✏️ DNS type daalo:\n`CNAME` | `A` | `NS` | `TXT`');
   }
-
   if (preset === 'vercel') {
     setSession(userId, { ...session, step: 'req_confirm_wait', data: { ...session.data, dnsType: 'CNAME', dnsValue: 'cname.vercel-dns.com', hosting: 'Vercel' } });
     return showRequestConfirm(chatId, userId);
   }
-
-  // Netlify — need their .netlify.app URL
-  if (preset === 'netlify') {
-    setSession(userId, { ...session, step: 'req_dns_value', data: { ...session.data, dnsType: 'CNAME', hosting: 'Netlify' } });
-    return reply(chatId,
-      `◈ *Netlify Setup*\n\n` +
-      `Netlify Dashboard → apni site → Site Settings → Domain Management → "yoursite.netlify.app" copy karo\n\n` +
-      `📌 Woh \`.netlify.app\` URL paste karo:\n_(Example: \`amazing-site-123.netlify.app\`)_\n\n` +
-      `⚠️ Sirf domain daalo, \`https://\` nahi.`
-    );
-  }
-
-  if (preset === 'github') {
-    setSession(userId, { ...session, step: 'req_dns_value', data: { ...session.data, dnsType: 'CNAME', hosting: 'GitHub Pages' } });
-    return reply(chatId,
-      `● *GitHub Pages Setup*\n\n` +
-      `Apna GitHub Pages URL daalo:\n_(Example: \`username.github.io\`)_\n\n` +
-      `⚠️ Sirf domain daalo, \`https://\` nahi.`
-    );
-  }
-
-  if (preset === 'vps') {
-    setSession(userId, { ...session, step: 'req_dns_value', data: { ...session.data, dnsType: 'A', hosting: 'Custom VPS' } });
-    return reply(chatId, `◉ *Custom VPS/Server*\n\nApna server ka public IP daalo:\n_(Example: \`1.2.3.4\`)_`);
-  }
-
-  if (preset === 'ns') {
-    setSession(userId, { ...session, step: 'req_dns_value', data: { ...session.data, dnsType: 'NS', hosting: 'NS Delegation' } });
-    return reply(chatId, `⬡ *NS Delegation*\n\nApna primary nameserver daalo:\n_(Example: \`ns1.yourprovider.com\`)_`);
-  }
+  const prompts = {
+    netlify: { type: 'CNAME', hosting: 'Netlify',      msg: `◈ *Netlify*\n\nApna \`.netlify.app\` URL paste karo:\n_(Example: \`amazing-site.netlify.app\`)_\n\n⚠️ https:// mat daalo.` },
+    github:  { type: 'CNAME', hosting: 'GitHub Pages', msg: `● *GitHub Pages*\n\nApna GitHub Pages URL paste karo:\n_(Example: \`username.github.io\`)_` },
+    vps:     { type: 'A',     hosting: 'Custom VPS',   msg: `◉ *Custom VPS/Server*\n\nApna server IP daalo:\n_(Example: \`1.2.3.4\`)_` },
+    ns:      { type: 'NS',    hosting: 'NS Delegation', msg: `⬡ *NS Delegation*\n\nPrimary nameserver daalo:\n_(Example: \`ns1.provider.com\`)_` },
+  };
+  const p = prompts[preset];
+  if (!p) return;
+  setSession(userId, { ...session, step: 'req_dns_value', data: { ...session.data, dnsType: p.type, hosting: p.hosting } });
+  return reply(chatId, p.msg);
 }
 
-function showRequestConfirm(chatId, userId) {
+async function showRequestConfirm(chatId, userId) {
   const { data } = getSession(userId);
-  const approval = db.getSetting('requireApproval');
-  reply(chatId,
-    t(userId, 'req_confirm', { subdomain: data.subdomain, domain: DOMAIN, purpose: data.purpose, dnsType: data.dnsType, dnsValue: data.dnsValue, hosting: data.hosting || 'custom' }) +
-    `\n\n${approval ? '⏳ Admin approval required.' : '✅ Will be auto-approved!'}`,
+  if (!data?.subdomain) return startRequest(chatId, userId);
+  const approval = await db.getSetting('requireApproval');
+  await reply(chatId,
+    `✅ *Request Summary — Confirm karo:*\n\n` +
+    `🌐 Domain: \`${data.subdomain}.${DOMAIN}\`\n` +
+    `📝 Purpose: ${data.purpose}\n` +
+    `🔧 DNS: \`${data.dnsType}\` → \`${data.dnsValue}\`\n` +
+    `🏠 Hosting: ${data.hosting || 'Custom'}\n\n` +
+    `${approval ? '⏳ Admin approval required.' : '✅ Auto-approved!'}`,
     { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[
-      { text: '✅ Confirm', callback_data: 'req_confirm' },
-      { text: '❌ Cancel', callback_data: 'req_cancel'  },
-    ]]}}
+      { text: '✅ Confirm & Submit', callback_data: 'req_confirm' },
+      { text: '❌ Cancel',           callback_data: 'req_cancel'  },
+    ]]}},
   );
 }
 
 async function confirmRequest(chatId, userId) {
   const session = getSession(userId);
-  if (!session.data?.subdomain) return reply(chatId, '❌ Session expired. /request again.');
   const { data } = session;
+  if (!data?.subdomain) return startRequest(chatId, userId);
   clearSession(userId);
 
-  const max = db.getSetting('maxPerUser');
-  const approval = db.getSetting('requireApproval');
-  if (db.getSubdomain(data.subdomain)) return reply(chatId, `❌ \`${data.subdomain}.${DOMAIN}\` already taken.`);
-  if (db.getUserSubdomains(userId).filter(s => ['active','pending'].includes(s.status)).length >= max) return reply(chatId, t(userId, 'max_limit', max));
+  const [max, approval, exists, userSubs] = await Promise.all([
+    db.getSetting('maxPerUser'),
+    db.getSetting('requireApproval'),
+    db.getSubdomain(data.subdomain),
+    db.getUserSubdomains(userId),
+  ]);
+
+  if (exists) return reply(chatId, `❌ \`${data.subdomain}.${DOMAIN}\` already le li gayi. Dusra naam try karo.`);
+  const active = userSubs.filter(s => ['active','pending'].includes(s.status));
+  if (active.length >= max) {
+    const menu = await mainMenu(userId);
+    return reply(chatId, `❌ Max ${max} subdomains limit reach ho gayi.`, menu);
+  }
 
   const subId = uuidv4();
   let cfRecordId = null;
@@ -470,11 +567,11 @@ async function confirmRequest(chatId, userId) {
     try {
       const rec = await cf.addRecord(data.subdomain, data.dnsType, data.dnsValue);
       cfRecordId = rec.id;
-    } catch (e) { console.error('CF error:', e.message); }
+    } catch (e) { console.error('CF error on confirm:', e.message); }
   }
 
-  const user = db.getUser(userId);
-  db.addSubdomain({
+  const user = await db.getUser(userId);
+  await db.addSubdomain({
     id: subId, userId: String(userId),
     userName: user?.firstName || '', userUsername: user?.username || '',
     subdomain: data.subdomain, fullDomain: `${data.subdomain}.${DOMAIN}`,
@@ -483,224 +580,297 @@ async function confirmRequest(chatId, userId) {
     createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
   });
 
+  const menu = await mainMenu(userId);
   if (!approval) {
-    reply(chatId, t(userId, 'req_approved', { fullDomain: `${data.subdomain}.${DOMAIN}` }), mainMenu(userId));
+    await reply(chatId,
+      `🎉 *Subdomain Active Ho Gayi!*\n\n` +
+      `\`${data.subdomain}.${DOMAIN}\`\n\n` +
+      `✅ Cloudflare pe DNS add ho gaya!\n` +
+      `🔒 HTTPS automatic active hai.\n` +
+      `⏱ Propagation: 1–30 minutes\n\n` +
+      `🔍 Check: whatsmydns.net`,
+      menu
+    );
   } else {
-    reply(chatId, t(userId, 'req_submitted', `${data.subdomain}.${DOMAIN}`), mainMenu(userId));
-    sendAdmin(
+    await reply(chatId,
+      `✅ *Request Submit Ho Gayi!*\n\n\`${data.subdomain}.${DOMAIN}\`\n\n⏳ Admin approve karega, notification aayega.`,
+      menu
+    );
+    await sendAdmin(
       `🔔 *New Subdomain Request*\n\n` +
-      `👤 ${user?.firstName} (@${user?.username || 'N/A'}) | \`${userId}\`\n` +
+      `👤 ${user?.firstName} (@${user?.username || 'N/A'}) | ID: \`${userId}\`\n` +
       `🌐 \`${data.subdomain}.${DOMAIN}\`\n` +
       `📝 ${data.purpose}\n` +
       `🔧 ${data.dnsType} → ${data.dnsValue}\n` +
-      `🏠 ${data.hosting}`,
+      `🏠 ${data.hosting || 'custom'}`,
       { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[
         { text: '✅ Approve', callback_data: `approve_${subId}` },
         { text: '❌ Reject',  callback_data: `reject_${subId}`  },
-      ]]}}
+      ]]}},
     );
   }
 }
 
-// ── My Subdomains ─────────────────────────────────────────────────────────────
-function showMySubdomains(chatId, userId) {
-  const subs = db.getUserSubdomains(userId);
-  if (!subs.length) return reply(chatId, t(userId, 'no_subs'), { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '🌐 Request', callback_data: 'req_start' }]] }});
-
-  const hi = lang(userId) === 'hi';
-  const buttons = subs.map(s => ([{ text: `${statusEmoji(s.status)} ${s.subdomain}.${DOMAIN}`, callback_data: `sub_detail_${s.id}` }]));
-  buttons.push([{ text: '🏠 Menu', callback_data: 'main_menu' }]);
-  reply(chatId, `🌐 *${hi ? 'Mere Subdomains' : 'My Subdomains'}* (${subs.length})`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
+// ── My Subdomains ──────────────────────────────────────────────────────────────
+async function showMySubdomains(chatId, userId) {
+  const subs = await db.getUserSubdomains(userId);
+  if (!subs.length) {
+    return reply(chatId, '🌐 *Mere Subdomains*\n\nAbhi koi subdomain nahi hai.\n\nNaya request karo! 👇', {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: [[{ text: '🌐 Request Subdomain', callback_data: 'req_start' }]] },
+    });
+  }
+  const buttons = subs.map(s => ([{
+    text: `${statusEmoji(s.status)} ${s.subdomain}.${DOMAIN}`,
+    callback_data: `sub_detail_${s.id}`,
+  }]));
+  buttons.push([{ text: '🏠 Main Menu', callback_data: 'main_menu' }]);
+  await reply(chatId, `🌐 *Mere Subdomains* (${subs.length})`, {
+    parse_mode: 'Markdown',
+    reply_markup: { inline_keyboard: buttons },
+  });
 }
 
-function showSubDetail(chatId, userId, subId) {
-  const sub = db.getSubdomainById(subId);
+async function showSubDetail(chatId, userId, subId) {
+  const sub = await db.getSubdomainById(subId);
   if (!sub || sub.userId !== String(userId)) return reply(chatId, '❌ Not found.');
-  const hi = lang(userId) === 'hi';
   const buttons = [];
   if (sub.status === 'active') {
     buttons.push([
-      { text: '⚙️ Update DNS', callback_data: `sub_dns_${subId}` },
+      { text: '⚙️ Update DNS',  callback_data: `sub_dns_${subId}` },
       { text: '📁 Upload File', callback_data: `sub_upload_${subId}` },
     ]);
-    buttons.push([{ text: '🔗 Open Site', url: `https://${sub.fullDomain}` }]);
+    buttons.push([{ text: '🔗 Site Open Karo', url: `https://${sub.fullDomain}` }]);
   }
   buttons.push([
     { text: '🗑️ Delete', callback_data: `sub_delete_${subId}` },
-    { text: '◀ Back', callback_data: 'my_subs' },
+    { text: '◀ Back',    callback_data: 'my_subs' },
   ]);
-  reply(chatId, formatSubdomainCard(sub, lang(userId)), { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
+  await reply(chatId, formatSubdomainCard(sub), {
+    parse_mode: 'Markdown',
+    reply_markup: { inline_keyboard: buttons },
+  });
 }
 
-// ── File Upload ───────────────────────────────────────────────────────────────
-function startFileUpload(chatId, userId, subId) {
-  const sub = db.getSubdomainById(subId);
+async function startFileUpload(chatId, userId, subId) {
+  const sub = await db.getSubdomainById(subId);
   if (!sub || sub.userId !== String(userId)) return reply(chatId, '❌ Not found.');
-  if (sub.status !== 'active') return reply(chatId, '❌ Subdomain must be active to upload files.');
+  if (sub.status !== 'active') return reply(chatId, '❌ Subdomain active honi chahiye file upload ke liye.');
   setSession(userId, { step: 'file_upload', data: { subId } });
-  reply(chatId, t(userId, 'file_ask') + `\n\n🌐 Subdomain: \`${sub.fullDomain}\`\n\n/cancel to stop.`);
+  return reply(chatId,
+    `📁 *File Upload Karo*\n\n` +
+    `🌐 Subdomain: \`${sub.fullDomain}\`\n\n` +
+    `Apna HTML ya ZIP file bhejo (max 5MB)\n\n/cancel to stop.`
+  );
 }
 
-// ── DNS Update ────────────────────────────────────────────────────────────────
-function startDnsUpdate(chatId, userId, subId) {
-  const sub = db.getSubdomainById(subId);
+async function startDnsUpdate(chatId, userId, subId) {
+  const sub = await db.getSubdomainById(subId);
   if (!sub || sub.userId !== String(userId)) return;
-  reply(chatId, `⚙️ *DNS Update — ${sub.subdomain}.${DOMAIN}*\n\nChoose hosting:`, {
+  await reply(chatId, `⚙️ *DNS Update — ${sub.subdomain}.${DOMAIN}*\n\nHosting provider chuniye:`, {
     parse_mode: 'Markdown',
     reply_markup: { inline_keyboard: [
-      [{ text: '▲ Vercel', callback_data: `dns_upd_preset_vercel|${subId}` }, { text: '◈ Netlify', callback_data: `dns_upd_preset_netlify|${subId}` }],
-      [{ text: '● GitHub', callback_data: `dns_upd_preset_github|${subId}` }, { text: '◉ VPS',    callback_data: `dns_upd_preset_vps|${subId}` }],
-      [{ text: '⬡ NS', callback_data: `dns_upd_preset_ns|${subId}` }, { text: '✏️ Manual', callback_data: `dns_upd_preset_manual|${subId}` }],
+      [{ text: '▲ Vercel', callback_data: `dns_upd_preset_vercel|${subId}` },
+       { text: '◈ Netlify', callback_data: `dns_upd_preset_netlify|${subId}` }],
+      [{ text: '● GitHub', callback_data: `dns_upd_preset_github|${subId}` },
+       { text: '◉ VPS',    callback_data: `dns_upd_preset_vps|${subId}` }],
+      [{ text: '⬡ NS',    callback_data: `dns_upd_preset_ns|${subId}` },
+       { text: '✏️ Manual', callback_data: `dns_upd_preset_manual|${subId}` }],
+      [{ text: '◀ Back',  callback_data: `sub_detail_${subId}` }],
     ]},
   });
 }
 
 async function applyDnsUpdatePreset(chatId, userId, rawData) {
-  const [preset, subId] = rawData.split('|');
-  const sub = db.getSubdomainById(subId);
+  const parts = rawData.split('|');
+  const preset = parts[0];
+  const subId  = parts[1];
+  const sub = await db.getSubdomainById(subId);
   if (!sub || sub.userId !== String(userId)) return;
 
   if (preset === 'vercel') {
     try {
       const rec = await cf.updateRecord(sub.cfRecordId, sub.subdomain, 'CNAME', 'cname.vercel-dns.com');
-      db.updateSubdomain(subId, { dnsType: 'CNAME', dnsValue: 'cname.vercel-dns.com', cfRecordId: rec.id });
-      return reply(chatId, t(userId, 'dns_updated', sub.fullDomain, 'CNAME', 'cname.vercel-dns.com'), mainMenu(userId));
+      await db.updateSubdomain(subId, { dnsType: 'CNAME', dnsValue: 'cname.vercel-dns.com', cfRecordId: rec.id });
+      const menu = await mainMenu(userId);
+      return reply(chatId, `✅ DNS Update!\n\`CNAME\` → \`cname.vercel-dns.com\`\n\n🌐 Cloudflare updated!`, menu);
     } catch (e) { return reply(chatId, `❌ ${e.message}`); }
   }
 
-  // Others need value input
-  const typeMap = { netlify: 'CNAME', github: 'CNAME', vps: 'A', ns: 'NS', manual: 'CNAME' };
-  const promptMap = {
-    netlify: `◈ *Netlify*\n\nPaste your \`.netlify.app\` URL:\n_(Without https://)_`,
-    github:  `● *GitHub Pages*\n\nPaste your GitHub Pages URL:\n_(Example: \`username.github.io\`)_`,
-    vps:     `◉ *VPS*\n\nEnter your server IP:`,
-    ns:      `⬡ *NS*\n\nEnter nameserver:`,
-    manual:  `✏️ Enter DNS value:`,
+  const typeMap    = { netlify:'CNAME', github:'CNAME', vps:'A', ns:'NS', manual:'CNAME' };
+  const promptMap  = {
+    netlify: '◈ Netlify\n\nApna `.netlify.app` URL daalo:\n_(Example: `mysite.netlify.app`)_',
+    github:  '● GitHub Pages\n\nApna GitHub URL daalo:\n_(Example: `username.github.io`)_',
+    vps:     '◉ VPS\n\nServer IP daalo:\n_(Example: `1.2.3.4`)_',
+    ns:      '⬡ NS\n\nNameserver daalo:\n_(Example: `ns1.provider.com`)_',
+    manual:  '✏️ DNS value daalo:',
   };
-
   setSession(userId, { step: 'dns_update_value', data: { subId, dnsType: typeMap[preset] || 'CNAME' } });
-  reply(chatId, promptMap[preset] || 'Enter DNS value:');
+  return reply(chatId, promptMap[preset] || 'Enter DNS value:');
 }
 
-function confirmDeleteSub(chatId, userId, subId) {
-  const sub = db.getSubdomainById(subId);
+async function confirmDeleteSub(chatId, userId, subId) {
+  const sub = await db.getSubdomainById(subId);
   if (!sub || sub.userId !== String(userId)) return;
-  const hi = lang(userId) === 'hi';
-  reply(chatId,
-    `⚠️ *${hi ? 'Delete Karo?' : 'Delete?'}*\n\n\`${sub.fullDomain}\`\n\n${hi ? 'Cloudflare DNS bhi remove ho jayega.' : 'Cloudflare DNS record will also be removed.'}\n\n*${hi ? 'Yeh undo nahi ho sakta!' : 'This cannot be undone!'}*`,
+  await reply(chatId,
+    `⚠️ *Delete Karo?*\n\n\`${sub.fullDomain}\`\n\nCloudflare DNS bhi remove ho jayega.\n*Yeh undo nahi ho sakta!*`,
     { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[
-      { text: hi ? '🗑️ Haan Delete' : '🗑️ Yes Delete', callback_data: `sub_delete_confirm_${subId}` },
-      { text: '❌ Cancel', callback_data: `sub_detail_${subId}` },
-    ]]}}
+      { text: '🗑️ Haan, Delete Karo', callback_data: `sub_delete_confirm_${subId}` },
+      { text: '❌ Cancel',             callback_data: `sub_detail_${subId}` },
+    ]]}},
   );
 }
 
 async function doDeleteSub(chatId, userId, subId) {
-  const sub = db.getSubdomainById(subId);
+  const sub = await db.getSubdomainById(subId);
   if (!sub || sub.userId !== String(userId)) return;
   if (sub.cfRecordId) { try { await cf.deleteRecord(sub.cfRecordId); } catch {} }
-  db.deleteSubdomain(subId);
-  db.deleteSubFiles(subId);
-  const hi = lang(userId) === 'hi';
-  reply(chatId, `✅ \`${sub.fullDomain}\` ${hi ? 'delete ho gayi!' : 'deleted!'}\n${hi ? 'Cloudflare DNS record bhi remove ho gaya.' : 'Cloudflare DNS removed.'}`, mainMenu(userId));
+  await db.deleteSubdomain(subId);
+  await db.deleteSubFiles(subId);
+  const menu = await mainMenu(userId);
+  return reply(chatId, `✅ \`${sub.fullDomain}\` delete ho gayi!\nCloudflare DNS bhi remove ho gaya.`, menu);
 }
 
-// ── DNS Guide ─────────────────────────────────────────────────────────────────
-function showDnsGuide(chatId, userId) {
-  const hi = lang(userId) === 'hi';
-  reply(chatId,
+async function showDnsGuide(chatId, userId) {
+  const menu = await mainMenu(userId);
+  await reply(chatId,
     `📖 *DNS Setup Guide*\n\n` +
-    `*▲ Vercel:*\n\`CNAME\` → \`cname.vercel-dns.com\`\n_(${hi ? 'Vercel → Settings → Domains mein bhi add karo' : 'Also add in Vercel → Settings → Domains'})_\n\n` +
-    `*◈ Netlify:*\n\`CNAME\` → \`yoursite.netlify.app\`\n_(${hi ? 'Netlify site URL — https:// mat daalo' : 'Your .netlify.app URL — without https://'})_\n\n` +
+    `*▲ Vercel:*\n\`CNAME\` → \`cname.vercel-dns.com\`\n_(Vercel → Settings → Domains mein bhi add karo)_\n\n` +
+    `*◈ Netlify:*\n\`CNAME\` → \`yoursite.netlify.app\`\n_(https:// mat daalo, sirf domain)_\n\n` +
     `*● GitHub Pages:*\n\`CNAME\` → \`username.github.io\`\n\n` +
     `*◉ Custom VPS:*\n\`A\` → \`your.server.ip\`\n\n` +
-    `*⬡ NS Delegation:*\n\`NS\` → \`ns1.yourprovider.com\`\n\n` +
-    `🔒 *HTTPS:* ${hi ? 'Cloudflare se automatic free HTTPS milta hai!' : 'Free HTTPS automatic via Cloudflare!'}\n` +
-    `⏱ *Propagation:* 1–30 min\n` +
-    `🔍 *Check:* whatsmydns.net`
+    `*⬡ NS Delegation (Full control):*\n\`NS\` → \`ns1.yourprovider.com\`\n\n` +
+    `🔒 HTTPS: *Cloudflare se automatic free!*\n` +
+    `⏱ Propagation: 1–30 min\n` +
+    `🔍 Check: whatsmydns.net`,
+    menu
   );
 }
 
-function startDnsCheck(chatId, userId) {
+async function startDnsCheck(chatId, userId) {
   setSession(userId, { step: 'dns_check' });
-  const hi = lang(userId) === 'hi';
-  reply(chatId, hi ? `🔍 Subdomain naam daalo check karne ke liye:\n_(Sirf naam, domain nahi)_\n\nExample: \`mysite\`` : `🔍 Enter subdomain name to check:\n_(Just the name, not full domain)_\n\nExample: \`mysite\``);
+  await reply(chatId,
+    `🔍 *DNS Check*\n\nSubdomain naam daalo:\n_(Sirf naam — domain nahi)_\n\nExample: agar \`mysite.${DOMAIN}\` check karna hai → sirf \`mysite\` likho\n\n/cancel to stop.`
+  );
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
 // ADMIN FUNCTIONS
 // ══════════════════════════════════════════════════════════════════════════════
 
-function showAdminPanel(chatId) {
-  const s = getStats();
-  reply(chatId,
-    `⚙️ *Admin Panel*\n\n🌐 \`${DOMAIN}\`\n📊 Total: ${s.total} | 🟢 ${s.active} | 🟡 ${s.pending} | 👥 ${s.users}`,
+async function getStats() {
+  const [subs, users] = await Promise.all([db.getAllSubdomains(), db.getAllUsers()]);
+  return {
+    total:     subs.length,
+    active:    subs.filter(s => s.status === 'active').length,
+    pending:   subs.filter(s => s.status === 'pending').length,
+    suspended: subs.filter(s => s.status === 'suspended').length,
+    users:     users.length,
+    banned:    users.filter(u => u.banned).length,
+  };
+}
+
+async function showAdminPanel(chatId) {
+  const s = await getStats();
+  const [approval, maintenance] = await Promise.all([
+    db.getSetting('requireApproval'),
+    db.getSetting('maintenanceMode'),
+  ]);
+  await reply(chatId,
+    `⚙️ *Admin Panel*\n\n` +
+    `🌐 Domain: \`${DOMAIN}\`\n` +
+    `📊 Total: ${s.total} | 🟢 Active: ${s.active} | 🟡 Pending: ${s.pending}\n` +
+    `👥 Users: ${s.users} | 🚫 Banned: ${s.banned}\n` +
+    `✅ Approval: ${approval ? 'Required' : 'Auto'} | 🔧 Maintenance: ${maintenance ? 'ON' : 'OFF'}`,
     { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [
-      [{ text: `🟡 Pending (${s.pending})`, callback_data: 'admin_pending' }, { text: '🟢 Active', callback_data: 'admin_active' }],
-      [{ text: '📋 All Subdomains', callback_data: 'admin_all' }, { text: '👥 Users', callback_data: 'admin_users' }],
-      [{ text: '📊 Stats', callback_data: 'admin_stats' }, { text: '⚙️ Settings', callback_data: 'admin_settings' }],
-      [{ text: '📢 Broadcast', callback_data: 'broadcast_start' }, { text: '🏠 Menu', callback_data: 'main_menu' }],
-    ]}}
+      [{ text: `🟡 Pending (${s.pending})`, callback_data: 'admin_pending' },
+       { text: '🟢 Active Subs',             callback_data: 'admin_active'  }],
+      [{ text: '📋 All Subdomains', callback_data: 'admin_all'      },
+       { text: '👥 Users',          callback_data: 'admin_users'    }],
+      [{ text: '📊 Stats',          callback_data: 'admin_stats'    },
+       { text: '⚙️ Settings',       callback_data: 'admin_settings' }],
+      [{ text: '📢 Broadcast',      callback_data: 'broadcast_start'},
+       { text: '🏠 Menu',           callback_data: 'main_menu'      }],
+    ]}},
   );
 }
 
-function getStats() {
-  const subs = db.getAllSubdomains();
-  return { total: subs.length, active: subs.filter(s => s.status === 'active').length, pending: subs.filter(s => s.status === 'pending').length, suspended: subs.filter(s => s.status === 'suspended').length, users: db.getAllUsers().length };
-}
-
-function showAdminStats(chatId) {
-  const s = getStats();
-  const banned = db.getAllUsers().filter(u => u.banned).length;
-  reply(chatId,
-    `📊 *Bot Statistics*\n\n🌐 Subdomains:\n├ Total: ${s.total}\n├ 🟢 Active: ${s.active}\n├ 🟡 Pending: ${s.pending}\n└ 🔴 Suspended: ${s.suspended}\n\n👥 Users: ${s.users} (${banned} banned)\n\n⚙️ Settings:\n├ Domain: \`${DOMAIN}\`\n├ Max/user: ${db.getSetting('maxPerUser')}\n├ Approval: ${db.getSetting('requireApproval') ? '✅' : '❌'}\n└ Maintenance: ${db.getSetting('maintenanceMode') ? '🔧 ON' : '✅ OFF'}`
+async function showAdminStats(chatId) {
+  const s = await getStats();
+  const [max, approval, maintenance] = await Promise.all([
+    db.getSetting('maxPerUser'),
+    db.getSetting('requireApproval'),
+    db.getSetting('maintenanceMode'),
+  ]);
+  await reply(chatId,
+    `📊 *Bot Statistics*\n\n` +
+    `🌐 Subdomains:\n├ Total: ${s.total}\n├ 🟢 Active: ${s.active}\n├ 🟡 Pending: ${s.pending}\n└ 🔴 Suspended: ${s.suspended}\n\n` +
+    `👥 Users: ${s.users} (🚫 ${s.banned} banned)\n\n` +
+    `⚙️ Settings:\n├ Domain: \`${DOMAIN}\`\n├ Max/user: ${max}\n├ Approval: ${approval ? '✅' : '❌ Auto'}\n└ Maintenance: ${maintenance ? '🔧 ON' : '✅ OFF'}`
   );
 }
 
-function showPendingRequests(chatId) {
-  const pending = db.getAllSubdomains({ status: 'pending' });
-  if (!pending.length) return reply(chatId, '✅ No pending requests!');
+async function showPendingRequests(chatId) {
+  const pending = await db.getAllSubdomains({ status: 'pending' });
+  if (!pending.length) return reply(chatId, '✅ Koi pending request nahi!');
   for (const s of pending.slice(0, 8)) {
-    bot.sendMessage(chatId,
-      `🟡 *Pending*\n\n🌐 \`${s.fullDomain}\`\n👤 ${s.userName} (@${s.userUsername || 'N/A'})\n📝 ${s.purpose}\n🔧 ${s.dnsType} → ${s.dnsValue}\n🏠 ${s.hosting || 'custom'}\n📅 ${s.createdAt?.split('T')[0]}`,
+    await bot.sendMessage(chatId,
+      `🟡 *Pending Request*\n\n` +
+      `🌐 \`${s.fullDomain}\`\n` +
+      `👤 ${s.userName} (@${s.userUsername || 'N/A'}) | \`${s.userId}\`\n` +
+      `📝 ${s.purpose}\n` +
+      `🔧 \`${s.dnsType}\` → \`${s.dnsValue}\`\n` +
+      `🏠 ${s.hosting || 'custom'}\n` +
+      `📅 ${s.createdAt?.split('T')[0]}`,
       { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[
         { text: '✅ Approve', callback_data: `approve_${s.id}` },
         { text: '❌ Reject',  callback_data: `reject_${s.id}`  },
-        { text: '🚫 Ban',     callback_data: `ban_${s.userId}` },
-      ]]}}
-    );
+        { text: '🚫 Ban User', callback_data: `ban_${s.userId}`},
+      ]]}},
+    ).catch(() => {});
   }
 }
 
-function showAdminSubdomains(chatId, filter) {
-  const subs = filter === 'all' ? db.getAllSubdomains() : db.getAllSubdomains({ status: filter });
-  if (!subs.length) return reply(chatId, `No subdomains (${filter}).`);
+async function showAdminSubdomains(chatId, filter) {
+  const subs = await (filter === 'all' ? db.getAllSubdomains() : db.getAllSubdomains({ status: filter }));
+  if (!subs.length) return reply(chatId, `📋 Koi subdomain nahi (${filter}).`);
   const list = subs.slice(0, 20).map(s => `${statusEmoji(s.status)} \`${s.subdomain}\` — ${s.userName}`).join('\n');
-  reply(chatId, `📋 *${filter} (${subs.length})*\n\n${list}`);
+  await reply(chatId, `📋 *${filter} (${subs.length})*\n\n${list}`);
 }
 
-function showAdminUsers(chatId) {
-  const users = db.getAllUsers();
-  if (!users.length) return reply(chatId, 'No users.');
-  const list = users.slice(0, 20).map(u => `${u.banned ? '🚫' : '✅'} ${u.firstName} (@${u.username || 'N/A'}) — ${db.getUserSubdomains(u.id).length} subs`).join('\n');
-  reply(chatId, `👥 *Users (${users.length})*\n\n${list}`);
+async function showAdminUsers(chatId) {
+  const users = await db.getAllUsers();
+  if (!users.length) return reply(chatId, '👥 Koi user nahi.');
+  const list = users.slice(0, 20).map(u => `${u.banned ? '🚫' : '✅'} ${u.firstName} (@${u.username || 'N/A'}) | \`${u.id}\``).join('\n');
+  await reply(chatId, `👥 *Users (${users.length})*\n\n${list}`);
 }
 
-function showAdminSettings(chatId) {
-  reply(chatId,
-    `⚙️ *Settings*\n\nDomain: \`${DOMAIN}\`\nMax/user: ${db.getSetting('maxPerUser')}\nApproval: ${db.getSetting('requireApproval') ? '✅ Required' : '❌ Auto'}\nMaintenance: ${db.getSetting('maintenanceMode') ? '🔧 ON' : '✅ OFF'}\nBroadcast Prefix: ${db.getSetting('broadcastPrefix') ? `"${db.getSetting('broadcastPrefix')}"` : 'OFF'}`,
+async function showAdminSettings(chatId) {
+  const [max, approval, maintenance, prefix] = await Promise.all([
+    db.getSetting('maxPerUser'),
+    db.getSetting('requireApproval'),
+    db.getSetting('maintenanceMode'),
+    db.getSetting('broadcastPrefix'),
+  ]);
+  await reply(chatId,
+    `⚙️ *Settings*\n\n` +
+    `Domain: \`${DOMAIN}\`\nMax/user: ${max}\n` +
+    `Approval: ${approval ? '✅ Required' : '❌ Auto'}\n` +
+    `Maintenance: ${maintenance ? '🔧 ON' : '✅ OFF'}\n` +
+    `Broadcast Prefix: ${prefix ? '✅ ON' : '❌ OFF'}`,
     { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [
-      [{ text: `${db.getSetting('requireApproval') ? '✅' : '❌'} Toggle Approval`,     callback_data: 'toggle_approval' }],
-      [{ text: `${db.getSetting('maintenanceMode') ? '🔧' : '✅'} Toggle Maintenance`,  callback_data: 'toggle_maintenance' }],
-      [{ text: '📢 Broadcast Prefix ON/OFF', callback_data: 'toggle_broadcast_prefix' }],
-      [{ text: '📝 Set Welcome Msg', callback_data: 'set_welcome' }, { text: '🔢 Set Max Subs', callback_data: 'set_maxsubs' }],
+      [{ text: `${approval ? '✅' : '❌'} Toggle Approval`,     callback_data: 'toggle_approval'    }],
+      [{ text: `${maintenance ? '🔧' : '✅'} Toggle Maintenance`, callback_data: 'toggle_maintenance' }],
+      [{ text: '📢 Broadcast Prefix ON/OFF', callback_data: 'toggle_bcast_prefix' }],
+      [{ text: '📝 Set Welcome Msg', callback_data: 'set_welcome' },
+       { text: '🔢 Set Max Subs',    callback_data: 'set_maxsubs' }],
       [{ text: '◀ Back', callback_data: 'admin_panel' }],
-    ]}}
+    ]}},
   );
 }
 
 async function adminApprove(chatId, subId) {
-  const sub = db.getSubdomainById(subId);
+  const sub = await db.getSubdomainById(subId);
   if (!sub) return reply(chatId, '❌ Not found.');
   if (sub.status === 'active') return reply(chatId, '✅ Already active!');
 
@@ -712,95 +882,140 @@ async function adminApprove(chatId, subId) {
     }
   } catch (e) { console.error('CF approve error:', e.message); }
 
-  db.updateSubdomain(subId, { status: 'active', cfRecordId: cfId });
-  reply(chatId, `✅ *Approved!* \`${sub.fullDomain}\`\nCloudflare DNS: ${cfId ? '✅ Added' : '⚠️ Not added (check CF config)'}`);
+  await db.updateSubdomain(subId, { status: 'active', cfRecordId: cfId });
+  await reply(chatId, `✅ *Approved!* \`${sub.fullDomain}\`\nCloudflare DNS: ${cfId ? '✅ Added' : '⚠️ Not added (CF config check karo)'}`);
 
   try {
-    bot.sendMessage(sub.userId, t(sub.userId, 'req_approved', sub), { parse_mode: 'Markdown' });
+    await bot.sendMessage(sub.userId,
+      `🎉 *Subdomain Approve Ho Gayi!*\n\n` +
+      `\`${sub.fullDomain}\`\n\n` +
+      `✅ DNS record Cloudflare pe add ho gaya!\n` +
+      `🔒 HTTPS automatic active hai.\n` +
+      `⏱ Propagation: 1–30 min\n` +
+      `🔍 Check: whatsmydns.net\n\n` +
+      `/mysubdomains — DNS settings update karo`,
+      { parse_mode: 'Markdown' }
+    );
   } catch {}
 }
 
-function adminReject(chatId, adminId, subId) {
-  const sub = db.getSubdomainById(subId);
+async function adminReject(chatId, adminId, subId) {
+  const sub = await db.getSubdomainById(subId);
   if (!sub) return reply(chatId, '❌ Not found.');
-  setSession(adminId, { step: 'admin_reject_reason', data: { subId } });
-  reply(chatId, `❌ Enter rejection reason for \`${sub.fullDomain}\`:`);
+  setSession(adminId, { step: 'reject_reason', data: { subId } });
+  await reply(chatId, `❌ Rejection reason type karo:\n_${sub.fullDomain}_ ke liye:`);
 }
 
 async function adminSuspend(chatId, subId) {
-  const sub = db.getSubdomainById(subId);
+  const sub = await db.getSubdomainById(subId);
   if (!sub) return reply(chatId, '❌ Not found.');
   if (sub.cfRecordId) { try { await cf.deleteRecord(sub.cfRecordId); } catch {} }
-  db.updateSubdomain(subId, { status: 'suspended', cfRecordId: null });
-  reply(chatId, `🔴 \`${sub.fullDomain}\` suspended.`);
-  try { bot.sendMessage(sub.userId, t(sub.userId, 'suspended', sub.fullDomain), { parse_mode: 'Markdown' }); } catch {}
+  await db.updateSubdomain(subId, { status: 'suspended', cfRecordId: null });
+  await reply(chatId, `🔴 \`${sub.fullDomain}\` suspend ho gayi.`);
+  try { await bot.sendMessage(sub.userId, `⚠️ Aapki subdomain \`${sub.fullDomain}\` suspend ho gayi hai. Admin se contact karein.`, { parse_mode: 'Markdown' }); } catch {}
 }
 
 async function adminUnsuspend(chatId, subId) {
-  const sub = db.getSubdomainById(subId);
+  const sub = await db.getSubdomainById(subId);
   if (!sub) return reply(chatId, '❌ Not found.');
   let cfId = null;
-  try { if (sub.dnsType && sub.dnsValue) { const r = await cf.addRecord(sub.subdomain, sub.dnsType, sub.dnsValue); cfId = r.id; } } catch {}
-  db.updateSubdomain(subId, { status: 'active', cfRecordId: cfId });
-  reply(chatId, `🟢 \`${sub.fullDomain}\` unsuspended.`);
+  try {
+    if (sub.dnsType && sub.dnsValue) {
+      const r = await cf.addRecord(sub.subdomain, sub.dnsType, sub.dnsValue);
+      cfId = r.id;
+    }
+  } catch {}
+  await db.updateSubdomain(subId, { status: 'active', cfRecordId: cfId });
+  await reply(chatId, `🟢 \`${sub.fullDomain}\` unsuspend ho gayi!`);
 }
 
 async function adminDeleteSub(chatId, subId) {
-  const sub = db.getSubdomainById(subId);
+  const sub = await db.getSubdomainById(subId);
   if (!sub) return reply(chatId, '❌ Not found.');
   if (sub.cfRecordId) { try { await cf.deleteRecord(sub.cfRecordId); } catch {} }
-  db.deleteSubdomain(subId);
-  reply(chatId, `✅ \`${sub.fullDomain}\` deleted.`);
+  await db.deleteSubdomain(subId);
+  await reply(chatId, `✅ \`${sub.fullDomain}\` delete ho gayi.`);
 }
 
-function adminBanUser(chatId, userId)   { db.upsertUser(userId, { banned: true  }); reply(chatId, `🚫 User \`${userId}\` banned.`);   try { bot.sendMessage(userId, t(userId, 'banned')); } catch {} }
-function adminUnbanUser(chatId, userId) { db.upsertUser(userId, { banned: false }); reply(chatId, `✅ User \`${userId}\` unbanned.`); }
+async function adminBanUser(chatId, userId) {
+  await db.upsertUser(userId, { banned: true });
+  await reply(chatId, `🚫 User \`${userId}\` ban ho gaya.`);
+  try { await bot.sendMessage(userId, '🚫 Aapko ban kar diya gaya hai.'); } catch {}
+}
 
-function toggleApproval(chatId)    { const c = db.getSetting('requireApproval'); db.setSetting('requireApproval', !c); reply(chatId, `✅ Approval: *${!c ? 'Required (manual)' : 'Auto-approve'}*`); }
-function toggleMaintenance(chatId) { const c = db.getSetting('maintenanceMode'); db.setSetting('maintenanceMode', !c); reply(chatId, `✅ Maintenance: *${!c ? 'ON' : 'OFF'}*`); }
-function toggleBroadcastPrefix(chatId, userId) {
-  const current = db.getSetting('broadcastPrefix');
+async function adminUnbanUser(chatId, userId) {
+  await db.upsertUser(userId, { banned: false });
+  await reply(chatId, `✅ User \`${userId}\` unban ho gaya.`);
+}
+
+async function toggleApproval(chatId) {
+  const c = await db.getSetting('requireApproval');
+  await db.setSetting('requireApproval', !c);
+  await reply(chatId, `✅ Approval: *${!c ? 'Required (manual approve)' : 'Auto-approve'}*`);
+}
+
+async function toggleMaintenance(chatId) {
+  const c = await db.getSetting('maintenanceMode');
+  await db.setSetting('maintenanceMode', !c);
+  await reply(chatId, `✅ Maintenance: *${!c ? '🔧 ON' : '✅ OFF'}*`);
+}
+
+async function toggleBroadcastPrefix(chatId) {
+  const current = await db.getSetting('broadcastPrefix');
   if (current) {
-    db.setSetting('broadcastPrefix', '');
-    reply(chatId, t(userId, 'broadcast_prefix_off'));
+    await db.setSetting('broadcastPrefix', '');
+    await reply(chatId, '📢 Broadcast prefix OFF ho gaya — sirf aapka message jayega.');
   } else {
-    db.setSetting('broadcastPrefix', '📢 *Admin Announcement*\n\n');
-    reply(chatId, t(userId, 'broadcast_prefix_on'));
+    await db.setSetting('broadcastPrefix', '📢 *Admin Announcement*\n\n');
+    await reply(chatId, '📢 Broadcast prefix ON — "Admin Announcement" heading add hogi.');
   }
 }
 
-function startBroadcast(chatId, userId) {
-  if (!isAdmin(userId)) return;
+async function startBroadcast(chatId, userId) {
   setSession(userId, { step: 'broadcast_msg' });
-  reply(chatId, '📢 *Broadcast*\n\nType message to send to all users:\n\n/cancel to stop.');
+  await reply(chatId, '📢 *Broadcast*\n\nWoh message type karo jo sabko bhejna hai:\n\n/cancel se rok sakte ho.');
 }
 
-function startSetWelcome(chatId, userId) { if (!isAdmin(userId)) return; setSession(userId, { step: 'set_welcome' }); reply(chatId, `📝 Enter new welcome message:\n\n_(Current: "${db.getSetting('welcomeMsg')}")_`); }
-function startSetMaxSubs(chatId, userId) { if (!isAdmin(userId)) return; setSession(userId, { step: 'set_maxsubs' }); reply(chatId, `🔢 Enter max subdomains per user (1–50):\n_(Current: ${db.getSetting('maxPerUser')})_`); }
-
 async function doBroadcast(chatId, text) {
-  const prefix = db.getSetting('broadcastPrefix') || '';
-  const users = db.getAllUsers();
+  const [prefix, users] = await Promise.all([
+    db.getSetting('broadcastPrefix'),
+    db.getAllUsers(),
+  ]);
+  const fullMsg = (prefix || '') + text;
   let sent = 0, failed = 0;
   await reply(chatId, `📤 Sending to ${users.length} users...`);
   for (const u of users) {
     try {
-      await bot.sendMessage(u.id, prefix + text, { parse_mode: 'Markdown' });
+      await bot.sendMessage(u.id, fullMsg, { parse_mode: 'Markdown' });
       sent++;
-      await new Promise(r => setTimeout(r, 40)); // Telegram rate limit safe
+      await new Promise(r => setTimeout(r, 40));
     } catch { failed++; }
   }
-  reply(chatId, `✅ Broadcast complete!\n✉️ Sent: ${sent} | ❌ Failed: ${failed}`);
+  await reply(chatId, `✅ Broadcast complete!\n✉️ Sent: ${sent} | ❌ Failed: ${failed}`);
 }
 
-// ── Daily Stats Cron ──────────────────────────────────────────────────────────
-cron.schedule('0 9 * * *', () => {
-  const s = getStats();
-  sendAdmin(`📊 *Daily Report — ${new Date().toLocaleDateString('en-IN')}*\n\n🌐 Active: ${s.active} | Pending: ${s.pending}\n👥 Users: ${s.users}`);
+async function startSetWelcome(chatId, userId) {
+  setSession(userId, { step: 'set_welcome' });
+  const current = await db.getSetting('welcomeMsg');
+  await reply(chatId, `📝 Naya welcome message type karo:\n\n_(Current: "${current}")_\n\n/cancel to stop.`);
+}
+
+async function startSetMaxSubs(chatId, userId) {
+  setSession(userId, { step: 'set_maxsubs' });
+  const current = await db.getSetting('maxPerUser');
+  await reply(chatId, `🔢 Max subdomains per user set karo (1–50):\n_(Current: ${current})_`);
+}
+
+// ── Daily stats cron ───────────────────────────────────────────────────────────
+cron.schedule('0 9 * * *', async () => {
+  try {
+    const s = await getStats();
+    await sendAdmin(`📊 *Daily Report — ${new Date().toLocaleDateString('en-IN')}*\n\n🌐 Active: ${s.active} | Pending: ${s.pending}\n👥 Users: ${s.users}`);
+  } catch {}
 });
 
 // ── Error handling ─────────────────────────────────────────────────────────────
 bot.on('polling_error', (e) => console.error('Polling error:', e.code, e.message));
-process.on('unhandledRejection', (e) => console.error('Unhandled:', e?.message));
+process.on('unhandledRejection', (e) => console.error('Unhandled rejection:', e?.message));
 
-console.log('🤖 Bot ready! Send /start to your bot on Telegram.');
+console.log('🤖 Bot ready!');
