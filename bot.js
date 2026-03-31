@@ -23,20 +23,11 @@ http.createServer((req, res) => {
   res.end(JSON.stringify({ status: 'ok', uptime: Math.floor(process.uptime()) + 's' }));
 }).listen(PORT, () => console.log(`✅ HTTP on port ${PORT}`));
 
-// ── Bot — pehle DB connect hoga, phir polling shuru ──────────────────────────
+// ── Bot variable — handlers ke neeche define hoga ────────────────────────────
 let bot;
-(async () => {
-  try {
-    await db.connectDB();
-    await db.initSettings();
-    bot = new TelegramBot(TOKEN, { polling: true });
-    bot.on('polling_error', (e) => console.error('Polling:', e.code, e.message));
-    console.log(`✅ Bot started | ${DOMAIN}`);
-  } catch (e) {
-    console.error('❌ Startup failed:', e.message);
-    process.exit(1);
-  }
-})();
+
+// called after DB connects
+function registerHandlers() {
 
 // ── Sessions (in-memory, only for conversation flow — not data) ────────────────
 const sessions = {};
@@ -1027,3 +1018,20 @@ cron.schedule('0 9 * * *', async () => {
 
 // ── Error handling ────────────────────────────────────────────────────────────
 process.on('unhandledRejection', (e) => console.error('Unhandled:', e?.message));
+
+} // end registerHandlers
+
+// ── STARTUP — pehle DB connect, phir handlers register ───────────────────────
+(async () => {
+  try {
+    await db.connectDB();
+    await db.initSettings();
+    bot = new TelegramBot(TOKEN, { polling: true });
+    bot.on('polling_error', (e) => console.error('Polling:', e.code, e.message));
+    console.log(`✅ Bot started | ${DOMAIN}`);
+    registerHandlers(); // ab sab handlers register karo
+  } catch (e) {
+    console.error('❌ Startup failed:', e.message);
+    process.exit(1);
+  }
+})();
