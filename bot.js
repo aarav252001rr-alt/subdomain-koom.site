@@ -23,9 +23,20 @@ http.createServer((req, res) => {
   res.end(JSON.stringify({ status: 'ok', uptime: Math.floor(process.uptime()) + 's' }));
 }).listen(PORT, () => console.log(`✅ HTTP on port ${PORT}`));
 
-// ── Bot init ───────────────────────────────────────────────────────────────────
-const bot = new TelegramBot(TOKEN, { polling: true });
-console.log(`✅ SubDomain Bot started | ${DOMAIN}`);
+// ── Bot — pehle DB connect hoga, phir polling shuru ──────────────────────────
+let bot;
+(async () => {
+  try {
+    await db.connectDB();
+    await db.initSettings();
+    bot = new TelegramBot(TOKEN, { polling: true });
+    bot.on('polling_error', (e) => console.error('Polling:', e.code, e.message));
+    console.log(`✅ Bot started | ${DOMAIN}`);
+  } catch (e) {
+    console.error('❌ Startup failed:', e.message);
+    process.exit(1);
+  }
+})();
 
 // ── Sessions (in-memory, only for conversation flow — not data) ────────────────
 const sessions = {};
@@ -1014,8 +1025,5 @@ cron.schedule('0 9 * * *', async () => {
   } catch {}
 });
 
-// ── Error handling ─────────────────────────────────────────────────────────────
-bot.on('polling_error', (e) => console.error('Polling error:', e.code, e.message));
-process.on('unhandledRejection', (e) => console.error('Unhandled rejection:', e?.message));
-
-console.log('🤖 Bot ready!');
+// ── Error handling ────────────────────────────────────────────────────────────
+process.on('unhandledRejection', (e) => console.error('Unhandled:', e?.message));
