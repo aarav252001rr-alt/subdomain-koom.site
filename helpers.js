@@ -1,77 +1,76 @@
 const { getSetting } = require('./database');
 
-// ── Subdomain Validation ──────────────────────────────────────────────────────
 function validateSubdomain(name) {
-  if (!name) return '❌ Subdomain name required hai.';
+  if (!name) return 'INVALID: Subdomain name required.';
   name = name.toLowerCase().trim();
-  if (name.length < 3) return '❌ Subdomain kam se kam 3 characters ka hona chahiye.';
-  if (name.length > 30) return '❌ Subdomain zyada se zyada 30 characters ka ho sakta hai.';
-  if (!/^[a-z0-9][a-z0-9-]*[a-z0-9]$/.test(name) && !/^[a-z0-9]$/.test(name))
-    return '❌ Sirf lowercase letters (a-z), numbers (0-9) aur hyphen (-) allowed hai.';
-  if (/--/.test(name)) return '❌ Double hyphen (--) allowed nahi.';
-
+  if (name.length < 3) return 'INVALID: Min 3 characters.';
+  if (name.length > 30) return 'INVALID: Max 30 characters.';
+  if (!/^[a-z0-9][a-z0-9-]*[a-z0-9]$/.test(name) && !/^[a-z0-9]{3}$/.test(name))
+    return 'INVALID: Only lowercase letters, numbers, hyphens. No leading/trailing hyphens.';
+  if (/--/.test(name)) return 'INVALID: Double hyphen not allowed.';
   const banned = getSetting('bannedWords') || [];
-  if (banned.includes(name)) return `❌ "${name}" reserved word hai — dusra naam chuniye.`;
-
-  return null; // valid
+  if (banned.includes(name)) return `INVALID: "${name}" is reserved.`;
+  return null;
 }
 
-// ── DNS Validation ────────────────────────────────────────────────────────────
+// ── Improved DNS validation — catches wrong Netlify URLs etc. ─────────────────
 function validateDnsValue(type, value) {
-  value = value.trim();
-  if (!value) return '❌ DNS value empty hai.';
+  value = (value || '').trim();
+  if (!value) return 'INVALID: DNS value cannot be empty.';
 
   if (type === 'A') {
-    const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/;
-    if (!ipRegex.test(value)) return '❌ A record ke liye valid IPv4 address chahiye.\nExample: `1.2.3.4`';
-    const parts = value.split('.').map(Number);
-    if (parts.some(p => p > 255)) return '❌ Invalid IP address.';
+    if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(value)) return 'INVALID_A';
+    if (value.split('.').map(Number).some(p => p > 255)) return 'INVALID_A';
   }
 
   if (type === 'CNAME') {
+    // Must be a valid domain, not a full URL
+    if (value.startsWith('http://') || value.startsWith('https://'))
+      return 'INVALID_CNAME_URL'; // special code — we strip it
     if (!/^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(value))
-      return '❌ CNAME ke liye valid domain chahiye.\nExample: `cname.vercel-dns.com`';
+      return 'INVALID_CNAME';
+    // Netlify URL must end with .netlify.app
+    // GitHub must end with .github.io  — warn but allow
   }
 
   if (type === 'NS') {
-    if (!/^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(value))
-      return '❌ NS ke liye valid nameserver domain chahiye.\nExample: `ns1.cloudflare.com`';
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(value)) return 'INVALID_NS';
   }
 
-  return null; // valid
+  return null;
 }
 
-// ── Status Emoji ──────────────────────────────────────────────────────────────
-function statusEmoji(status) {
-  const map = { active: '🟢', pending: '🟡', suspended: '🔴', rejected: '❌' };
-  return map[status] || '⚪';
+// Strip https:// or http:// if user pastes full URL
+function stripUrl(value) {
+  return value.replace(/^https?:\/\//i, '').replace(/\/.*$/, '').trim();
 }
 
-// ── Format Subdomain Card ─────────────────────────────────────────────────────
-function formatSubdomainCard(s) {
+function statusEmoji(s) {
+  return { active: '🟢', pending: '🟡', suspended: '🔴', rejected: '❌' }[s] || '⚪';
+}
+
+function formatSubdomainCard(s, lang = 'en') {
   const domain = getSetting('domain');
+  const labels = lang === 'hi'
+    ? { status: 'Status', dns: 'DNS', cf: 'CF Record', purpose: 'Makasad', created: 'Banaya' }
+    : { status: 'Status', dns: 'DNS', cf: 'CF Record', purpose: 'Purpose', created: 'Created' };
   return [
     `${statusEmoji(s.status)} *${s.subdomain}.${domain}*`,
-    `├ Status: \`${s.status.toUpperCase()}\``,
-    `├ DNS: \`${s.dnsType || 'Not set'}\` → \`${s.dnsValue || '—'}\``,
-    `├ CF Record: \`${s.cfRecordId ? '✅ Linked' : '❌ Not linked'}\``,
-    `├ Purpose: ${s.purpose || '—'}`,
-    `└ Created: ${s.createdAt?.split('T')[0] || '—'}`,
+    `├ ${labels.status}: \`${s.status.toUpperCase()}\``,
+    `├ ${labels.dns}: \`${s.dnsType || 'Not set'}\` → \`${s.dnsValue || '—'}\``,
+    `├ ${labels.cf}: \`${s.cfRecordId ? '✅ Linked' : '❌ Not set'}\``,
+    `├ 🔒 HTTPS: \`${s.cfRecordId ? '✅ Active (Cloudflare)' : '⏳ After DNS set'}\``,
+    `├ ${labels.purpose}: ${s.purpose || '—'}`,
+    `└ ${labels.created}: ${s.createdAt?.split('T')[0] || '—'}`,
   ].join('\n');
 }
 
-// ── DNS Hosting Presets ───────────────────────────────────────────────────────
 const DNS_PRESETS = {
-  vercel: { label: '▲ Vercel', type: 'CNAME', value: 'cname.vercel-dns.com', note: 'Vercel → Settings → Domains mein bhi add karo' },
-  netlify: { label: '◈ Netlify', type: 'CNAME', value: 'yoursite.netlify.app', note: 'yoursite ki jagah apna Netlify site name daalo' },
-  github: { label: '● GitHub Pages', type: 'CNAME', value: 'username.github.io', note: 'username ki jagah apna GitHub username daalo' },
-  vps: { label: '◉ VPS/Server', type: 'A', value: '0.0.0.0', note: '0.0.0.0 ki jagah apna server IP daalo' },
-  ns: { label: '⬡ NS Delegation', type: 'NS', value: 'ns1.provider.com', note: 'Aapko full DNS control milega apne subdomain pe' },
+  vercel:  { label: '▲ Vercel',        type: 'CNAME', value: 'cname.vercel-dns.com',  note: 'Also add domain in Vercel → Settings → Domains' },
+  netlify: { label: '◈ Netlify',       type: 'CNAME', value: '',                       note: 'Paste your .netlify.app URL (without https://)' },
+  github:  { label: '● GitHub Pages',  type: 'CNAME', value: '',                       note: 'Paste your username.github.io URL' },
+  vps:     { label: '◉ Custom VPS',    type: 'A',     value: '',                       note: 'Enter your server IP address' },
+  ns:      { label: '⬡ NS Delegation', type: 'NS',    value: '',                       note: 'Enter your nameserver (ns1.provider.com)' },
 };
 
-// ── Escape Markdown ───────────────────────────────────────────────────────────
-function esc(text) {
-  return String(text).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
-}
-
-module.exports = { validateSubdomain, validateDnsValue, statusEmoji, formatSubdomainCard, DNS_PRESETS, esc };
+module.exports = { validateSubdomain, validateDnsValue, stripUrl, statusEmoji, formatSubdomainCard, DNS_PRESETS };
