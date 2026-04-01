@@ -36,7 +36,9 @@ http.createServer((req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // BOT — polling:false se start, DB ready hone ke baad polling shuru hogi
 // ─────────────────────────────────────────────────────────────────────────────
-const bot = new TelegramBot(TOKEN, { polling: false });
+// Bot with polling:true — messages turant aane lagenge
+// DB ready hone se pehle aane wale messages session check se filter ho jayenge
+const bot = new TelegramBot(TOKEN, { polling: true });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SESSION STORE — in-memory, sirf conversation flow ke liye
@@ -259,8 +261,13 @@ bot.on('callback_query', async (query) => {
 // MESSAGE HANDLER — conversation state machine
 // ─────────────────────────────────────────────────────────────────────────────
 
+// DB ready flag
+let dbReady = false;
+
 bot.on('message', async (msg) => {
   if (!msg.from) return;
+  if (!dbReady) return; // DB connect hone se pehle koi message process mat karo
+
   const userId  = msg.from.id;
   const chatId  = msg.chat.id;
   const session = getSession(userId);
@@ -886,9 +893,9 @@ cron.schedule('0 9 * * *', async () => {
   try {
     await db.connectDB();
     await db.initSettings();
-    await bot.startPolling();          // ← sirf yahan polling shuru hoti hai
     bot.on('polling_error', (e) => console.error('Polling error:', e.code, e.message));
-    console.log(`✅ Bot polling started | ${DOMAIN}`);
+    dbReady = true;
+    console.log(`✅ Bot ready | ${DOMAIN}`);
   } catch (e) {
     console.error('❌ Startup failed:', e.message);
     process.exit(1);
