@@ -605,7 +605,7 @@ async function showSubDetail(chatId, userId, subId) {
     btns.push([{ text:'🔗 Site Open Karo', url:`https://${sub.fullDomain}` }]);
   }
   btns.push([{ text:'🗑️ Delete', callback_data:`sub_delete_${subId}` }, { text:'◀ Back', callback_data:'my_subs' }]);
-  await send(chatId, formatSubdomainCard(sub), { parse_mode:'Markdown', reply_markup:{ inline_keyboard:btns } });
+  await send(chatId, formatSubdomainCard(sub, DOMAIN), { parse_mode:'Markdown', reply_markup:{ inline_keyboard:btns } });
 }
 
 async function startFileUpload(chatId, userId, subId) {
