@@ -1,118 +1,199 @@
-// ── File Storage via Telegram's own CDN + metadata in DB ─────────────────────
-// Strategy: Files stay on Telegram servers (free, no limit),
-// we store file_id + metadata. For actual web hosting we use
-// a free static host: surge.sh via their API or store on github gist.
-// For MVP: we store the Telegram file_id and provide download link.
-
 const axios = require('axios');
-const { addFileRecord, getSubFiles, deleteSubFiles } = require('./database');
 const { v4: uuidv4 } = require('uuid');
+const { addFileRecord, deleteSubFiles, getSubFiles } = require('./database');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const MAX_MB = 5;
+const MAX_MB    = 5;
 const MAX_BYTES = MAX_MB * 1024 * 1024;
-const ALLOWED_EXTS = ['.html', '.zip', '.htm'];
 
-// Get file info from Telegram
-async function getTgFile(fileId) {
-  const res = await axios.get(`https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`);
-  if (!res.data.ok) throw new Error('Cannot get file info');
-  return res.data.result; // { file_id, file_path, file_size }
+// Supported file types aur unke content types
+const CONTENT_TYPES = {
+  '.html': 'text/html;charset=UTF-8',
+  '.htm':  'text/html;charset=UTF-8',
+  '.css':  'text/css',
+  '.js':   'application/javascript',
+  '.json': 'application/json',
+  '.png':  'image/png',
+  '.jpg':  'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif':  'image/gif',
+  '.svg':  'image/svg+xml',
+  '.ico':  'image/x-icon',
+  '.txt':  'text/plain',
+  '.zip':  'application/zip',
+};
+
+// ── Telegram se file info lo ───────────────────────────────────────────────────
+async function getTgFileInfo(fileId) {
+  const res = await axios.get(
+    `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`
+  );
+  if (!res.data.ok) throw new Error('Telegram file info error');
+  return res.data.result; // { file_path, file_size }
 }
 
-// Download file buffer from Telegram
-async function downloadTgFile(filePath) {
-  const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
-  const res = await axios.get(url, { responseType: 'arraybuffer' });
-  return Buffer.from(res.data);
-}
+// ── ZIP ke andar se files nikalo (in-memory) ───────────────────────────────────
+async function extractZipFiles(buffer) {
+  const JSZip = require('jszip');
+  const zip   = await JSZip.loadAsync(buffer);
+  const files  = {};
 
-// Upload HTML content to surge.sh (free static hosting)
-async function deployToSurge(htmlContent, subdomain, domain) {
-  // Surge.sh doesn't have official API but we can use their npm CLI.
-  // For Telegram bot context, we'll store in a Pastebin-like service
-  // and link to it, OR we host the file on the CF worker.
-  // Best free option: telegra.ph for HTML preview OR github gist.
-  // We'll use a simple approach: store file_id and give download link.
-  return { hosted: false, reason: 'Use Cloudflare Pages or Netlify to deploy the file.' };
-}
+  const promises = [];
+  zip.forEach((relativePath, zipEntry) => {
+    if (zipEntry.dir) return;
+    if (relativePath.includes('__MACOSX') || relativePath.includes('.DS_Store')) return;
 
-// Upload to file.io (temp) or return tg CDN link
-async function storeTgFile(bot, fileMsg, subdomainId, subdomain, domain) {
-  const doc = fileMsg.document;
-  if (!doc) return { error: 'No document found.' };
+    // Top-level folder strip karo agar hai
+    let cleanPath = relativePath;
+    const firstSlash = relativePath.indexOf('/');
+    if (firstSlash > 0 && firstSlash < relativePath.length - 1) {
+      cleanPath = relativePath.slice(firstSlash + 1);
+    }
+    if (!cleanPath) return;
 
-  const fileName = doc.file_name || 'index.html';
-  const ext = fileName.slice(fileName.lastIndexOf('.')).toLowerCase();
-  if (!ALLOWED_EXTS.includes(ext)) return { error: 'wrong_type' };
+    promises.push(
+      zipEntry.async('nodebuffer').then(content => {
+        files[cleanPath] = content;
+      })
+    );
+  });
 
-  const fileSize = doc.file_size || 0;
-  if (fileSize > MAX_BYTES) return { error: 'too_big', mb: (fileSize / 1024 / 1024).toFixed(1) };
+  await Promise.all(promises);
 
-  // Get file path from Telegram
-  const tgFile = await getTgFile(doc.file_id);
-
-  // Download the actual content
-  const buffer = await downloadTgFile(tgFile.file_path);
-
-  // Try to deploy to Cloudflare Pages via API if configured
-  // Otherwise just store file_id so user can download
-  let deployUrl = null;
-  if (ext === '.html' || ext === '.htm') {
-    try {
-      deployUrl = await deployToCloudflarePages(buffer, subdomain, domain, fileName);
-    } catch (e) {
-      console.log('CF Pages deploy failed:', e.message);
+  // index.html ensure karo
+  if (!files['index.html'] && !files['index.htm']) {
+    const htmlFile = Object.keys(files).find(f => f.endsWith('.html') || f.endsWith('.htm'));
+    if (htmlFile) {
+      files['index.html'] = files[htmlFile];
+      delete files[htmlFile];
     }
   }
 
-  // Store record
-  const record = {
-    id: uuidv4(),
-    subdomainId,
-    subdomain,
-    fileName,
-    fileId: doc.file_id,
-    filePath: tgFile.file_path,
-    fileSize,
-    ext,
-    deployUrl,
-    uploadedAt: new Date().toISOString(),
-  };
-
-  // Remove old files for this subdomain (keep only latest)
-  deleteSubFiles(subdomainId);
-  addFileRecord(record);
-
-  return { success: true, record, deployUrl };
+  return files;
 }
 
-// Cloudflare Pages deploy via API (if CF Pages configured)
-async function deployToCloudflarePages(htmlBuffer, subdomain, domain, fileName) {
-  const CF_ACCOUNT = process.env.CF_ACCOUNT_ID;
-  const CF_TOKEN = process.env.CF_API_TOKEN;
-  const CF_PAGES_PROJECT = process.env.CF_PAGES_PROJECT;
-
-  if (!CF_ACCOUNT || !CF_PAGES_PROJECT) throw new Error('CF Pages not configured');
-
+// ── Telegram pe file upload karo (bot ke saath) ───────────────────────────────
+async function uploadBufferToTelegram(buffer, filename, botToken, storageChatId) {
   const FormData = require('form-data');
   const form = new FormData();
-  form.append('manifest', JSON.stringify({ '/index.html': fileName }));
-  form.append(fileName, htmlBuffer, { filename: fileName, contentType: 'text/html' });
+  form.append('chat_id', storageChatId);
+  form.append('document', buffer, { filename });
 
   const res = await axios.post(
-    `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/pages/projects/${CF_PAGES_PROJECT}/deployments`,
+    `https://api.telegram.org/bot${botToken}/sendDocument`,
     form,
-    { headers: { ...form.getHeaders(), Authorization: `Bearer ${CF_TOKEN}` } }
+    { headers: form.getHeaders(), maxBodyLength: Infinity }
   );
 
-  if (!res.data.success) throw new Error('CF Pages deploy failed');
-  return res.data.result?.url;
+  if (!res.data.ok) throw new Error('Telegram upload failed: ' + res.data.description);
+  return res.data.result.document; // { file_id, file_path, file_size, ... }
 }
 
-// Get download URL for a stored file
-function getFileDownloadUrl(record) {
-  return `https://api.telegram.org/file/bot${BOT_TOKEN}/${record.filePath}`;
+// ── Main: Bot se file receive karke process karo ──────────────────────────────
+async function storeTgFile(bot, fileMsg, subdomainId, subdomain, domain) {
+  const doc = fileMsg.document;
+  if (!doc) return { error: 'No document' };
+
+  const fileName = doc.file_name || 'index.html';
+  const ext      = fileName.slice(fileName.lastIndexOf('.')).toLowerCase();
+  const isZip    = ext === '.zip';
+  const allowed  = ['.html', '.htm', '.css', '.js', '.zip'];
+
+  if (!allowed.includes(ext)) return { error: 'wrong_type' };
+  if ((doc.file_size || 0) > MAX_BYTES) return { error: 'too_big', mb: ((doc.file_size||0)/1024/1024).toFixed(1) };
+
+  // Telegram se file download karo
+  const tgInfo = await getTgFileInfo(doc.file_id);
+  const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${tgInfo.file_path}`;
+  const res = await axios.get(fileUrl, { responseType: 'arraybuffer' });
+  const buffer = Buffer.from(res.data);
+
+  // Purani files delete karo
+  await deleteSubFiles(subdomainId);
+
+  const STORAGE_CHAT = process.env.STORAGE_CHAT_ID || process.env.ADMIN_ID;
+  const uploadedFiles = [];
+
+  if (isZip) {
+    // ZIP extract karo aur har file alag alag store karo
+    const files = await extractZipFiles(buffer);
+    const fileList = Object.entries(files);
+
+    if (!fileList.length) return { error: 'zip_empty' };
+
+    for (const [filePath, fileBuffer] of fileList) {
+      const fileExt = filePath.includes('.') ? '.' + filePath.split('.').pop().toLowerCase() : '';
+      const ct = CONTENT_TYPES[fileExt] || 'application/octet-stream';
+
+      // Telegram pe store karo
+      const tgDoc = await uploadBufferToTelegram(fileBuffer, filePath, BOT_TOKEN, STORAGE_CHAT);
+
+      const record = {
+        id: uuidv4(), subdomainId, subdomain,
+        filePath: filePath,           // web path: "index.html", "css/style.css"
+        tgFileId: tgDoc.file_id,      // Telegram file_id
+        tgFilePath: null,             // getFile se milega on-demand
+        contentType: ct,
+        fileSize: fileBuffer.length,
+        isIndex: filePath === 'index.html' || filePath === 'index.htm',
+        uploadedAt: new Date().toISOString(),
+      };
+      await addFileRecord(record);
+      uploadedFiles.push(filePath);
+    }
+  } else {
+    // Single HTML/CSS/JS file
+    const ct = CONTENT_TYPES[ext] || 'text/html;charset=UTF-8';
+
+    // Telegram pe store karo
+    const tgDoc = await uploadBufferToTelegram(buffer, 'index.html', BOT_TOKEN, STORAGE_CHAT);
+
+    const record = {
+      id: uuidv4(), subdomainId, subdomain,
+      filePath: 'index.html',
+      tgFileId: tgDoc.file_id,
+      tgFilePath: null,
+      contentType: ct,
+      fileSize: buffer.length,
+      isIndex: true,
+      uploadedAt: new Date().toISOString(),
+    };
+    await addFileRecord(record);
+    uploadedFiles.push('index.html');
+  }
+
+  return { success: true, files: uploadedFiles };
 }
 
-module.exports = { storeTgFile, getTgFile, getFileDownloadUrl, MAX_MB, ALLOWED_EXTS };
+// ── Worker ke liye: file serve karo ──────────────────────────────────────────
+// path = requested URL path, e.g. "/" or "/about.html" or "/css/style.css"
+async function getFileForWorker(subdomain, requestPath) {
+  const files = await getSubFiles(null, subdomain); // subdomain se dhundho
+  if (!files || !files.length) return null;
+
+  // Path normalize karo
+  let filePath = requestPath.replace(/^\//, '') || 'index.html';
+  if (filePath.endsWith('/')) filePath += 'index.html';
+  if (!filePath.includes('.')) filePath += '/index.html';
+
+  // File dhundho
+  let fileRecord = files.find(f => f.filePath === filePath);
+
+  // Nahi mila toh index.html do
+  if (!fileRecord) {
+    fileRecord = files.find(f => f.isIndex || f.filePath === 'index.html');
+  }
+
+  if (!fileRecord) return null;
+
+  // Telegram file path refresh karo (file_id se)
+  const tgInfo = await getTgFileInfo(fileRecord.tgFileId);
+
+  return {
+    filePath:    tgInfo.file_path,     // Telegram CDN path
+    contentType: fileRecord.contentType,
+    fileName:    fileRecord.filePath,
+  };
+}
+
+module.exports = { storeTgFile, getFileForWorker, MAX_MB, CONTENT_TYPES };

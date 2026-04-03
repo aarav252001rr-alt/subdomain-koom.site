@@ -1,10 +1,8 @@
 {
-  "name": "telegram-subdomain-bot-v3",
-  "version": "3.1.0",
+  "name": "telegram-subdomain-bot",
+  "version": "5.0.0",
   "main": "bot.js",
-  "scripts": {
-    "start": "node bot.js"
-  },
+  "scripts": { "start": "node bot.js" },
   "dependencies": {
     "node-telegram-bot-api": "^0.66.0",
     "axios": "^1.6.2",
@@ -12,7 +10,8 @@
     "mongoose": "^8.2.0",
     "uuid": "^9.0.1",
     "node-cron": "^3.0.3",
-    "form-data": "^4.0.0"
+    "form-data": "^4.0.0",
+    "jszip": "^3.10.1"
   },
   "engines": { "node": ">=18.0.0" }
 }

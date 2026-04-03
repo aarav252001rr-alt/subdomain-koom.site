@@ -122,7 +122,10 @@ const deleteSubdomain = (id) => Subdomain.deleteOne({ id });
 
 // ── File helpers ───────────────────────────────────────────────────────────────
 const addFileRecord = (data)  => new FileRec(data).save();
-const getSubFiles   = (subId) => FileRec.find({ subdomainId: subId }).lean();
+const getSubFiles   = (subId, subdomain) => {
+  if (subdomain) return FileRec.find({ subdomain }).lean();
+  return FileRec.find({ subdomainId: subId }).lean();
+};
 const deleteSubFiles= (subId) => FileRec.deleteMany({ subdomainId: subId });
 
 // ── Settings helpers ───────────────────────────────────────────────────────────

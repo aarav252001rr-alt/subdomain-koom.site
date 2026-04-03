@@ -11,7 +11,7 @@ const cf          = require('./cloudflare');
 const db          = require('./database');
 const { validateSubdomain, validateDnsValue, stripUrl, statusEmoji, formatSubdomainCard } = require('./helpers');
 const { detectLang, LANGS } = require('./i18n');
-const { storeTgFile, getFileDownloadUrl } = require('./storage');
+const { storeTgFile, getFileForWorker } = require('./storage');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CONFIG
@@ -24,11 +24,52 @@ if (!TOKEN)    { console.error('❌ BOT_TOKEN missing in .env'); process.exit(1)
 if (!ADMIN_ID) { console.error('❌ ADMIN_ID missing in .env');  process.exit(1); }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HTTP SERVER — Render Web Service ke liye zaroori
+// HTTP SERVER — Render Web Service + Cloudflare Worker API
 // ─────────────────────────────────────────────────────────────────────────────
-http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('SubDomain Bot is running!');
+const url = require('url');
+const API_SECRET = process.env.API_SECRET || 'change-this-secret';
+
+http.createServer(async (req, res) => {
+  const parsed = url.parse(req.url, true);
+  const path   = parsed.pathname;
+  const query  = parsed.query;
+
+  // Health check
+  if (path === '/' || path === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ status: 'ok', bot: 'SubDomain Bot' }));
+  }
+
+  // Worker API — Cloudflare Worker yahan se file info leta hai
+  // GET /worker/file?subdomain=ritesh&path=/about.html&secret=xxx
+  if (path === '/worker/file') {
+    if (query.secret !== API_SECRET) {
+      res.writeHead(401);
+      return res.end(JSON.stringify({ success: false, error: 'Unauthorized' }));
+    }
+
+    const subdomain   = query.subdomain;
+    const requestPath = query.path || '/';
+
+    if (!subdomain) {
+      res.writeHead(400);
+      return res.end(JSON.stringify({ success: false, error: 'subdomain required' }));
+    }
+
+    try {
+      const file = await getFileForWorker(subdomain, requestPath);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      if (!file) return res.end(JSON.stringify({ success: false, error: 'not found' }));
+      return res.end(JSON.stringify({ success: true, file }));
+    } catch (e) {
+      res.writeHead(500);
+      return res.end(JSON.stringify({ success: false, error: e.message }));
+    }
+  }
+
+  res.writeHead(404);
+  res.end('Not found');
+
 }).listen(process.env.PORT || 3000, () => {
   console.log('✅ HTTP server started');
 });
@@ -278,14 +319,28 @@ bot.on('message', async (msg) => {
       clearSession(userId);
       const sub = await db.getSubdomainById(session.data.subId);
       if (!sub || sub.userId !== String(userId)) return;
-      await send(chatId, '⏳ File upload ho rahi hai...');
+      await send(chatId, '⏳ File process ho rahi hai... thoda wait karo.');
       const result = await storeTgFile(bot, msg, session.data.subId, sub.subdomain, DOMAIN);
-      if (result.error === 'wrong_type') return send(chatId, '❌ Sirf .html ya .zip files allowed hain.');
-      if (result.error === 'too_big')    return send(chatId, `❌ File bahut badi! Max 5MB. Aapki: ${result.mb}MB`);
-      if (result.error)                  return send(chatId, `❌ Upload error: ${result.error}`);
       const menu = await mainMenu(userId);
+
+      if (result.error === 'wrong_type')
+        return send(chatId, '❌ Sirf .html, .htm, .css, .js ya .zip files allowed hain.', menu);
+      if (result.error === 'too_big')
+        return send(chatId, `❌ File bahut badi hai! Max ${result.mb ? result.mb + 'MB' : '5MB'} allowed hai.`, menu);
+      if (result.error === 'zip_empty')
+        return send(chatId, '❌ ZIP file empty hai ya properly extract nahi hua.', menu);
+      if (result.error)
+        return send(chatId, `❌ Error: ${result.error}`, menu);
+
+      const fileCount = result.files?.length || 1;
+      const fileList = (result.files || []).slice(0,5).map(f => '• ' + f).join('\n');
       return send(chatId,
-        `✅ *File Upload Ho Gayi!*\n📁 \`${result.record.fileName}\`\n🌐 \`https://${sub.fullDomain}\`\n\n📥 [Download](${getFileDownloadUrl(result.record)})`,
+        `🎉 *Website Live Ho Gayi!*\n\n` +
+        `🌐 URL: \`https://${sub.fullDomain}\`\n\n` +
+        `📁 Files uploaded: ${fileCount}\n${fileList}\n\n` +
+        `✅ Files Telegram pe store hain.\n` +
+        `🔄 Jab bhi koi site open karega, files serve hongi.\n\n` +
+        `_Naye files upload karne ke liye dobara Upload File use karo._`,
         { ...menu, disable_web_page_preview: true }
       );
     }
@@ -613,7 +668,19 @@ async function startFileUpload(chatId, userId, subId) {
   if (!sub || sub.userId !== String(userId)) return send(chatId, '❌ Not found.');
   if (sub.status !== 'active') return send(chatId, '❌ Subdomain active honi chahiye.');
   setSession(userId, { step:'file_upload', data:{ subId } });
-  return send(chatId, `📁 *File Upload Karo*\n\n🌐 \`${sub.fullDomain}\`\n\nApna HTML ya ZIP file bhejo (max 5MB)\n\n/cancel to stop.`);
+  return send(chatId,
+    `📁 *Website Files Upload Karo*\n\n` +
+    `🌐 Subdomain: \`${sub.fullDomain}\`\n\n` +
+    `*Kya bhej sakte ho:*\n` +
+    `• Single HTML file (\`index.html\`)\n` +
+    `• ZIP file (poora website folder — max 5MB)\n\n` +
+    `*ZIP mein kya ho:*\n` +
+    `\`index.html\` (homepage)\n` +
+    `\`style.css\`, \`script.js\` (optional)\n` +
+    `Images, fonts, etc.\n\n` +
+    `⚡ File Cloudflare Pages pe automatically deploy hogi!\n\n` +
+    `/cancel to stop.`
+  );
 }
 
 async function startDnsUpdate(chatId, userId, subId) {
